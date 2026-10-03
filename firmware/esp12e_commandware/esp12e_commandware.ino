@@ -45,6 +45,15 @@ struct Job
 static Job jobs[8];
 static String inputBuffer;
 
+struct PendingWritePulse
+{
+    bool active = false;
+    int pin = -1;
+    unsigned long endTime = 0;
+};
+
+static PendingWritePulse pendingWritePulse;
+
 struct SignalState
 {
     bool hasPrev = false;
@@ -129,7 +138,7 @@ static void printHelp()
     Serial.println(F("status"));
     Serial.println(F("reset"));
     Serial.println(F("read PIN"));
-    Serial.println(F("write PIN VALUE"));
+    Serial.println(F("write PIN VALUE [DURATION_MS]"));
     Serial.println(F("adc A0"));
     Serial.println(F("clock MS [PIN]"));
     Serial.println(F("map IN_MIN IN_MAX OUT_MIN OUT_MAX VALUE"));
@@ -314,9 +323,21 @@ static bool applySignalStage(Stage &stage, bool &hasValue, int &value)
         return true;
     }
     case STAGE_WRITE:
+    {
+        int writeValue = (stage.p2 >= 0) ? stage.p2 : value;
+        int durationMs = (stage.p3 >= 0) ? stage.p3 : ((stage.p2 >= 0) ? value : -1);
+
         pinMode(stage.p1, OUTPUT);
-        digitalWrite(stage.p1, value ? HIGH : LOW);
+        digitalWrite(stage.p1, writeValue ? HIGH : LOW);
+
+        if (durationMs > 0 && writeValue != 0)
+        {
+            pendingWritePulse.pin = stage.p1;
+            pendingWritePulse.endTime = millis() + (unsigned long)durationMs;
+            pendingWritePulse.active = true;
+        }
         return true;
+    }
     case STAGE_PRINT:
         Serial.println(value);
         return true;
@@ -391,6 +412,19 @@ static bool parsePipelineStage(const String &stageText, Stage &stage)
         }
         stage.kind = STAGE_WRITE;
         stage.p1 = pin;
+        stage.p2 = -1;
+        stage.p3 = -1;
+
+        String valueToken = nextToken(args);
+        if (valueToken.length() > 0)
+        {
+            stage.p2 = toIntDef(valueToken, -1);
+            String durationToken = nextToken(args);
+            if (durationToken.length() > 0)
+            {
+                stage.p3 = toIntDef(durationToken, -1);
+            }
+        }
         return true;
     }
     if (name == "print")
@@ -421,6 +455,8 @@ static void handleWriteCommand(String args)
     int pin = toIntDef(token, -1);
     String valueToken = nextToken(args);
     int value = toIntDef(valueToken, LOW);
+    String durationToken = nextToken(args);
+    int durationMs = toIntDef(durationToken, -1);
     if (pin < 0)
     {
         Serial.println(F("ERROR: write requires PIN VALUE"));
@@ -428,6 +464,26 @@ static void handleWriteCommand(String args)
     }
     pinMode(pin, OUTPUT);
     digitalWrite(pin, value ? HIGH : LOW);
+
+    if (value == 0)
+    {
+        pendingWritePulse.active = false;
+        pendingWritePulse.pin = -1;
+        pendingWritePulse.endTime = 0;
+    }
+    else if (durationMs > 0)
+    {
+        pendingWritePulse.pin = pin;
+        pendingWritePulse.endTime = millis() + (unsigned long)durationMs;
+        pendingWritePulse.active = true;
+    }
+    else
+    {
+        pendingWritePulse.active = false;
+        pendingWritePulse.pin = -1;
+        pendingWritePulse.endTime = 0;
+    }
+
     Serial.println(value ? 1 : 0);
 }
 
@@ -1070,6 +1126,15 @@ void loop()
     }
 
     unsigned long now = millis();
+    if (pendingWritePulse.active && now >= pendingWritePulse.endTime)
+    {
+        pinMode(pendingWritePulse.pin, OUTPUT);
+        digitalWrite(pendingWritePulse.pin, LOW);
+        pendingWritePulse.active = false;
+        pendingWritePulse.pin = -1;
+        pendingWritePulse.endTime = 0;
+    }
+
     for (int i = 0; i < 8; ++i)
     {
         if (!jobs[i].active)
