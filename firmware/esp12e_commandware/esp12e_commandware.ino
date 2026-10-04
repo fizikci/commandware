@@ -1,4 +1,158 @@
 #include <Arduino.h>
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+
+struct Stage;
+
+static const char *WIFI_SSID = "KESKIN";
+static const char *WIFI_PASSWORD = "";
+static const unsigned long WIFI_RETRY_INTERVAL = 15000;
+
+static ESP8266WebServer webServer(80);
+static bool webServerStarted = false;
+static unsigned long lastWifiAttempt = 0;
+static Print *commandOutput = &Serial;
+
+class StringPrint : public Print
+{
+public:
+    size_t write(uint8_t value) override
+    {
+        buffer += (char)value;
+        return 1;
+    }
+
+    const String &str() const
+    {
+        return buffer;
+    }
+
+private:
+    String buffer;
+};
+
+static void handleCommand(const String &line);
+static String trim(String value);
+
+static const char WEB_PAGE[] PROGMEM = R"rawliteral(
+<!doctype html>
+<html lang="en">
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta charset="utf-8">
+  <title>Commandware</title>
+  <style>
+    :root { color-scheme: dark; font: 16px/1.5 system-ui, sans-serif; background: #0b1120; color: #e5edf8; }
+    * { box-sizing: border-box; }
+    body { max-width: 32rem; min-height: 100vh; margin: 0 auto; padding: max(1.5rem, env(safe-area-inset-top)) 1rem max(2rem, env(safe-area-inset-bottom)); }
+    h1 { margin: 0; font-size: 1.8rem; letter-spacing: -.04em; }
+    h2 { margin: 0 0 1rem; font-size: 1.1rem; }
+    header { margin-bottom: 1.5rem; }
+    header p { margin: .2rem 0 0; color: #93a4bc; font-size: .9rem; }
+    section { margin-top: 1rem; padding: 1rem; border: 1px solid #26344a; border-radius: 1rem; background: #111b2d; }
+    label { display: block; margin: .9rem 0 .35rem; color: #aebed3; font-size: .82rem; font-weight: 650; }
+    input, select, button { min-height: 3rem; border: 1px solid #34445d; border-radius: .7rem; font: inherit; }
+    input, select { width: 100%; padding: 0 .8rem; background: #0b1424; color: #edf4ff; }
+    select { margin-bottom: .2rem; }
+    #command-form { margin-top: .9rem; }
+    .command-row { display: flex; align-items: stretch; gap: .55rem; }
+    .command-row input { min-width: 0; flex: 1; }
+    button { padding: 0 .95rem; background: #2563eb; border-color: #3b82f6; color: white; font-weight: 700; cursor: pointer; touch-action: manipulation; }
+    button:active { background: #1d4ed8; }
+    button:disabled { opacity: .55; cursor: wait; }
+    pre { min-height: 4rem; margin: .8rem 0 0; padding: .85rem; overflow-wrap: anywhere; white-space: pre-wrap; border: 1px solid #26344a; border-radius: .7rem; background: #080e19; color: #c6d5e8; font: .88rem/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; }
+    #jobs-list { display: grid; gap: .6rem; margin: 0; padding: 0; list-style: none; }
+    #jobs-list li { display: flex; align-items: center; justify-content: space-between; gap: .6rem; min-width: 0; padding: .7rem; border: 1px solid #26344a; border-radius: .7rem; background: #0b1424; color: #c6d5e8; font-size: .88rem; overflow-wrap: anywhere; }
+    #jobs-list button { min-height: 2.4rem; flex: 0 0 auto; padding: 0 .7rem; border-color: #7f3441; background: #451923; color: #fecdd3; font-size: .82rem; }
+    #jobs-list button:active { background: #672331; }
+    @media (max-width: 360px) { body { padding-right: .75rem; padding-left: .75rem; } section { padding: .8rem; } .command-row { gap: .4rem; } .command-row button { padding: 0 .7rem; } }
+  </style>
+</head>
+<body>
+  <header><h1>Commandware</h1><p>ESP8266 control panel</p></header>
+  <main>
+    <section aria-label="Command console">
+      <form id="command-form">
+        <label for="command">Command · type or choose a suggestion</label>
+        <div class="command-row">
+          <input id="command" name="command" list="command-suggestions" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="e.g. read 4" required>
+          <datalist id="command-suggestions"></datalist>
+          <button type="submit">Run</button>
+        </div>
+      </form>
+      <pre id="result" aria-live="polite">Choose a command or enter one above.</pre>
+    </section>
+    <section aria-labelledby="jobs-heading">
+      <h2 id="jobs-heading">Running jobs</h2>
+      <ul id="jobs-list"><li>Loading...</li></ul>
+    </section>
+  </main>
+  <script>
+    const f=document.getElementById('command-form'),i=document.getElementById('command'),r=document.getElementById('result'),d=document.getElementById('command-suggestions'),j=document.getElementById('jobs-list'),k='commandware-history',p=['write 4 1','write 4 0','write 4 1 100','read 4','read 5','read 12','adc A0','clock 500 | write 5'];let busy=false;
+    function history(){try{const h=JSON.parse(localStorage.getItem(k)||'[]');return Array.isArray(h)?h.filter(x=>typeof x==='string'):[]}catch(e){console.error('Unable to load command history:',e);return[]}}
+    function suggestions(){const h=history();d.replaceChildren(...[...h,...p.filter(c=>!h.includes(c))].map(c=>{const o=document.createElement('option');o.value=c;return o}))}
+    function remember(c){try{localStorage.setItem(k,JSON.stringify([c,...history().filter(x=>x!==c)].slice(0,12)));suggestions()}catch(e){console.error('Unable to save command history:',e)}}
+    async function send(c){const x=await fetch('/api/command',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({command:c})}),t=await x.text();if(!x.ok)throw Error(t||x.statusText);return t}
+    async function refresh(){if(busy)return;busy=true;try{const t=await send('jobs'),a=t.split(/\r?\n/).map(s=>s.match(/^(\d+)\s+RUNNING\s+(.*)$/)).filter(Boolean);j.replaceChildren();if(!a.length){j.textContent='No jobs running.';return}a.forEach(m=>{const li=document.createElement('li'),b=document.createElement('button');li.append(document.createTextNode(`#${m[1]} ${m[2]} `));b.textContent='Kill';b.onclick=async()=>{b.disabled=true;try{r.textContent=await send(`kill ${m[1]}`);await refresh()}catch(e){r.textContent=`Request failed: ${e}`;b.disabled=false}};li.append(b);j.append(li)})}catch(e){j.textContent=`Unable to load jobs: ${e}`}finally{busy=false}}
+    f.onsubmit=async e=>{e.preventDefault();const c=i.value.trim();r.textContent='Running...';try{r.textContent=await send(c);remember(c);await refresh()}catch(x){r.textContent=`Request failed: ${x}`}};suggestions();refresh();setInterval(refresh,3000);
+  </script>
+</body>
+</html>
+)rawliteral";
+
+static void configureWebServer()
+{
+    webServer.on("/", HTTP_GET, []()
+                 { webServer.send_P(200, "text/html; charset=utf-8", WEB_PAGE); });
+    webServer.on("/api/command", HTTP_POST, []()
+                 {
+                     String command = webServer.arg("command");
+                     if (trim(command).length() == 0)
+                     {
+                         webServer.send(400, "text/plain; charset=utf-8", "ERROR: command is required");
+                         return;
+                     }
+
+                     StringPrint response;
+                     Print *previousOutput = commandOutput;
+                     commandOutput = &response;
+                     handleCommand(command);
+                     commandOutput = previousOutput;
+
+                     int statusCode = response.str().startsWith("ERROR:") ? 400 : 200;
+                     webServer.send(statusCode, "text/plain; charset=utf-8", response.str()); });
+    webServer.onNotFound([]()
+                         { webServer.send(404, "text/plain; charset=utf-8", "Not found"); });
+}
+
+static void serviceWebServer()
+{
+    if (WIFI_SSID[0] == '\0')
+    {
+        return;
+    }
+
+    if (WiFi.status() == WL_CONNECTED)
+    {
+        if (!webServerStarted)
+        {
+            webServer.begin();
+            webServerStarted = true;
+            Serial.print(F("Web interface: http://"));
+            Serial.println(WiFi.localIP());
+        }
+        webServer.handleClient();
+        return;
+    }
+
+    unsigned long now = millis();
+    if (now - lastWifiAttempt >= WIFI_RETRY_INTERVAL)
+    {
+        lastWifiAttempt = now;
+        WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+        Serial.println(F("Reconnecting to Wi-Fi..."));
+    }
+}
 
 enum StageKind
 {
@@ -130,29 +284,29 @@ static int mapValue(int value, int inMin, int inMax, int outMin, int outMax)
 
 static void printHelp()
 {
-    Serial.println(F("Commandware ESP-12E shell"));
-    Serial.println(F("help"));
-    Serial.println(F("pins"));
-    Serial.println(F("jobs"));
-    Serial.println(F("kill ID"));
-    Serial.println(F("status"));
-    Serial.println(F("reset"));
-    Serial.println(F("read PIN"));
-    Serial.println(F("write PIN VALUE [DURATION_MS]"));
-    Serial.println(F("adc A0"));
-    Serial.println(F("clock MS [PIN]"));
-    Serial.println(F("map IN_MIN IN_MAX OUT_MIN OUT_MAX VALUE"));
-    Serial.println(F("not VALUE"));
-    Serial.println(F("edge VALUE"));
-    Serial.println(F("rising VALUE"));
-    Serial.println(F("falling VALUE"));
-    Serial.println(F("debounce COUNT VALUE"));
-    Serial.println(F("toggle [VALUE]"));
-    Serial.println(F("divide N VALUE"));
-    Serial.println(F("pulse DURATION VALUE"));
-    Serial.println(F("print VALUE"));
-    Serial.println(F("shiftin DATA CLOCK LOAD [msb|lsb] [BITS]"));
-    Serial.println(F("shiftout DATA CLOCK LATCH [msb|lsb] VALUE"));
+    commandOutput->println(F("Commandware ESP-12E shell"));
+    commandOutput->println(F("help"));
+    commandOutput->println(F("pins"));
+    commandOutput->println(F("jobs"));
+    commandOutput->println(F("kill ID"));
+    commandOutput->println(F("status"));
+    commandOutput->println(F("reset"));
+    commandOutput->println(F("read PIN"));
+    commandOutput->println(F("write PIN VALUE [DURATION_MS]"));
+    commandOutput->println(F("adc A0"));
+    commandOutput->println(F("clock MS [PIN]"));
+    commandOutput->println(F("map IN_MIN IN_MAX OUT_MIN OUT_MAX VALUE"));
+    commandOutput->println(F("not VALUE"));
+    commandOutput->println(F("edge VALUE"));
+    commandOutput->println(F("rising VALUE"));
+    commandOutput->println(F("falling VALUE"));
+    commandOutput->println(F("debounce COUNT VALUE"));
+    commandOutput->println(F("toggle [VALUE]"));
+    commandOutput->println(F("divide N VALUE"));
+    commandOutput->println(F("pulse DURATION VALUE"));
+    commandOutput->println(F("print VALUE"));
+    commandOutput->println(F("shiftin DATA CLOCK LOAD [msb|lsb] [BITS]"));
+    commandOutput->println(F("shiftout DATA CLOCK LATCH [msb|lsb] VALUE"));
 }
 
 static void printPins()
@@ -163,15 +317,15 @@ static void printPins()
     const uint8_t pins[] = {0, 1, 2, 3, 4, 5, 12, 13, 14, 15, 16, A0};
     for (int i = 0; i < 12; ++i)
     {
-        Serial.print(names[i]);
-        Serial.print("\t");
+        commandOutput->print(names[i]);
+        commandOutput->print("\t");
         if (pins[i] == 1 || pins[i] == 3)
         {
-            Serial.println(F("terminal"));
+            commandOutput->println(F("terminal"));
         }
         else
         {
-            Serial.println(F("available"));
+            commandOutput->println(F("available"));
         }
     }
 }
@@ -184,9 +338,9 @@ static void printJobs()
         {
             continue;
         }
-        Serial.print(i + 1);
-        Serial.print(F(" RUNNING  "));
-        Serial.println(jobs[i].pipeline);
+        commandOutput->print(i + 1);
+        commandOutput->print(F(" RUNNING  "));
+        commandOutput->println(jobs[i].pipeline);
     }
 }
 
@@ -339,7 +493,7 @@ static bool applySignalStage(Stage &stage, bool &hasValue, int &value)
         return true;
     }
     case STAGE_PRINT:
-        Serial.println(value);
+        commandOutput->println(value);
         return true;
     default:
         return false;
@@ -350,6 +504,7 @@ static bool parsePipelineStage(const String &stageText, Stage &stage)
 {
     String args = stageText;
     String name = nextToken(args);
+    name.toLowerCase();
 
     if (name == "map")
     {
@@ -442,11 +597,11 @@ static void handleReadCommand(String args)
     int pin = toIntDef(token, -1);
     if (pin < 0)
     {
-        Serial.println(F("ERROR: read requires PIN"));
+        commandOutput->println(F("ERROR: read requires PIN"));
         return;
     }
     pinMode(pin, INPUT);
-    Serial.println(digitalRead(pin));
+    commandOutput->println(digitalRead(pin));
 }
 
 static void handleWriteCommand(String args)
@@ -459,7 +614,7 @@ static void handleWriteCommand(String args)
     int durationMs = toIntDef(durationToken, -1);
     if (pin < 0)
     {
-        Serial.println(F("ERROR: write requires PIN VALUE"));
+        commandOutput->println(F("ERROR: write requires PIN VALUE"));
         return;
     }
     pinMode(pin, OUTPUT);
@@ -484,18 +639,18 @@ static void handleWriteCommand(String args)
         pendingWritePulse.endTime = 0;
     }
 
-    Serial.println(value ? 1 : 0);
+    commandOutput->println(value ? 1 : 0);
 }
 
 static void handleADCCommand(String args)
 {
     String token = nextToken(args);
-    if (token.length() == 0 || token != "A0")
+    if (token.length() == 0 || !token.equalsIgnoreCase("A0"))
     {
-        Serial.println(F("ERROR: adc requires A0"));
+        commandOutput->println(F("ERROR: adc requires A0"));
         return;
     }
-    Serial.println(analogRead(A0));
+    commandOutput->println(analogRead(A0));
 }
 
 static void handleMapCommand(String args)
@@ -510,13 +665,13 @@ static void handleMapCommand(String args)
     int outMin = a3.toInt();
     int outMax = a4.toInt();
     int current = value.toInt();
-    Serial.println(mapValue(current, inMin, inMax, outMin, outMax));
+    commandOutput->println(mapValue(current, inMin, inMax, outMin, outMax));
 }
 
 static void handleNotCommand(String args)
 {
     int current = toIntDef(nextToken(args), 0);
-    Serial.println(current == 0 ? 1 : 0);
+    commandOutput->println(current == 0 ? 1 : 0);
 }
 
 static void handleEdgeCommand(String args)
@@ -524,11 +679,11 @@ static void handleEdgeCommand(String args)
     int current = toIntDef(nextToken(args), 0);
     if (!directEdgeState.hasPrev || current != directEdgeState.prev)
     {
-        Serial.println(current);
+        commandOutput->println(current);
     }
     else
     {
-        Serial.println(0);
+        commandOutput->println(0);
     }
     directEdgeState.prev = current;
     directEdgeState.hasPrev = true;
@@ -540,7 +695,7 @@ static void handleRisingCommand(String args)
     int output = (directRisingState.hasPrev && current > directRisingState.prev) ? 1 : 0;
     directRisingState.prev = current;
     directRisingState.hasPrev = true;
-    Serial.println(output);
+    commandOutput->println(output);
 }
 
 static void handleFallingCommand(String args)
@@ -549,7 +704,7 @@ static void handleFallingCommand(String args)
     int output = (directFallingState.hasPrev && current < directFallingState.prev) ? 1 : 0;
     directFallingState.prev = current;
     directFallingState.hasPrev = true;
-    Serial.println(output);
+    commandOutput->println(output);
 }
 
 static void handleDebounceCommand(String args)
@@ -570,11 +725,11 @@ static void handleDebounceCommand(String args)
 
     if (directDebounceState.streak >= threshold)
     {
-        Serial.println(current);
+        commandOutput->println(current);
     }
     else
     {
-        Serial.println(0);
+        commandOutput->println(0);
     }
 }
 
@@ -582,7 +737,7 @@ static void handleToggleCommand(String args)
 {
     (void)args;
     directToggleState.toggleState = (directToggleState.toggleState == 0) ? 1 : 0;
-    Serial.println(directToggleState.toggleState);
+    commandOutput->println(directToggleState.toggleState);
 }
 
 static void handleDivideCommand(String args)
@@ -592,11 +747,11 @@ static void handleDivideCommand(String args)
     directDivideState.divideCounter++;
     if ((directDivideState.divideCounter % divisor) == 0)
     {
-        Serial.println(current);
+        commandOutput->println(current);
     }
     else
     {
-        Serial.println(0);
+        commandOutput->println(0);
     }
 }
 
@@ -620,13 +775,13 @@ static void handlePulseCommand(String args)
     {
         directPulseState.pulseRemaining--;
     }
-    Serial.println(output);
+    commandOutput->println(output);
 }
 
 static void handlePrintCommand(String args)
 {
     int value = toIntDef(nextToken(args), 0);
-    Serial.println(value);
+    commandOutput->println(value);
 }
 
 static void handleShiftinCommand(String args)
@@ -638,11 +793,11 @@ static void handleShiftinCommand(String args)
     int bits = max(1, toIntDef(nextToken(args), 8));
     if (dataPin < 0 || clockPin < 0 || loadPin < 0)
     {
-        Serial.println(F("ERROR: shiftin requires DATA CLOCK LOAD [msb|lsb] [BITS]"));
+        commandOutput->println(F("ERROR: shiftin requires DATA CLOCK LOAD [msb|lsb] [BITS]"));
         return;
     }
 
-    bool msb = orderToken.length() == 0 || orderToken == "msb";
+    bool msb = orderToken.length() == 0 || orderToken.equalsIgnoreCase("msb");
 
     pinMode(dataPin, INPUT);
     pinMode(clockPin, OUTPUT);
@@ -667,7 +822,7 @@ static void handleShiftinCommand(String args)
         }
     }
 
-    Serial.println((int)value);
+    commandOutput->println((int)value);
 }
 
 static void handleShiftoutCommand(String args)
@@ -687,7 +842,7 @@ static void handleShiftoutCommand(String args)
     pinMode(clockPin, OUTPUT);
     pinMode(latchPin, OUTPUT);
 
-    bool msb = orderToken.length() == 0 || orderToken == "msb";
+    bool msb = orderToken.length() == 0 || orderToken.equalsIgnoreCase("msb");
     for (int i = 0; i < 8; ++i)
     {
         int bitIndex = msb ? (7 - i) : i;
@@ -698,7 +853,7 @@ static void handleShiftoutCommand(String args)
     }
     digitalWrite(latchPin, HIGH);
     digitalWrite(latchPin, LOW);
-    Serial.println(value);
+    commandOutput->println(value);
 }
 
 static void handleKillCommand(String args)
@@ -706,33 +861,34 @@ static void handleKillCommand(String args)
     int id = toIntDef(nextToken(args), -1);
     if (id < 1 || id > 8)
     {
-        Serial.println(F("ERROR: kill requires valid job id"));
+        commandOutput->println(F("ERROR: kill requires valid job id"));
         return;
     }
     if (!jobs[id - 1].active)
     {
-        Serial.print(F("ERROR: unknown job "));
-        Serial.println(id);
+        commandOutput->print(F("ERROR: unknown job "));
+        commandOutput->println(id);
         return;
     }
     jobs[id - 1].active = false;
     jobs[id - 1].stageCount = 0;
     jobs[id - 1].pipeline = "";
-    Serial.print(F("killed "));
-    Serial.println(id);
+    commandOutput->print(F("killed "));
+    commandOutput->println(id);
 }
 
 static bool evaluateImmediateSource(const String &sourceText, bool &hasValue, int &value)
 {
     String args = sourceText;
     String name = nextToken(args);
+    name.toLowerCase();
 
     if (name == "read")
     {
         int pin = toIntDef(nextToken(args), -1);
         if (pin < 0)
         {
-            Serial.println(F("ERROR: read requires PIN"));
+            commandOutput->println(F("ERROR: read requires PIN"));
             return false;
         }
         pinMode(pin, INPUT);
@@ -743,9 +899,9 @@ static bool evaluateImmediateSource(const String &sourceText, bool &hasValue, in
     if (name == "adc")
     {
         String pin = nextToken(args);
-        if (pin != "A0")
+        if (!pin.equalsIgnoreCase("A0"))
         {
-            Serial.println(F("ERROR: adc requires A0"));
+            commandOutput->println(F("ERROR: adc requires A0"));
             return false;
         }
         value = analogRead(A0);
@@ -782,7 +938,7 @@ static bool evaluateImmediateSource(const String &sourceText, bool &hasValue, in
         int pin = toIntDef(nextToken(args), -1);
         if (pin < 0)
         {
-            Serial.println(F("ERROR: write requires PIN VALUE"));
+            commandOutput->println(F("ERROR: write requires PIN VALUE"));
             return false;
         }
         int v = toIntDef(nextToken(args), 0);
@@ -799,9 +955,9 @@ static bool evaluateImmediateSource(const String &sourceText, bool &hasValue, in
         return true;
     }
 
-    Serial.print(F("ERROR: unsupported pipeline source '"));
-    Serial.print(name);
-    Serial.println(F("'"));
+    commandOutput->print(F("ERROR: unsupported pipeline source '"));
+    commandOutput->print(name);
+    commandOutput->println(F("'"));
     return false;
 }
 
@@ -827,9 +983,9 @@ static void runImmediatePipeline(const String &line)
         Stage stage;
         if (!parsePipelineStage(parts[i], stage))
         {
-            Serial.print(F("ERROR: unsupported pipeline stage '"));
-            Serial.print(parts[i]);
-            Serial.println(F("'"));
+            commandOutput->print(F("ERROR: unsupported pipeline stage '"));
+            commandOutput->print(parts[i]);
+            commandOutput->println(F("'"));
             return;
         }
         if (stage.kind == STAGE_WRITE || stage.kind == STAGE_PRINT)
@@ -838,14 +994,14 @@ static void runImmediatePipeline(const String &line)
         }
         if (!applySignalStage(stage, hasValue, value))
         {
-            Serial.println(F("ERROR: pipeline stage failure"));
+            commandOutput->println(F("ERROR: pipeline stage failure"));
             return;
         }
     }
 
     if (hasValue && !hasSink)
     {
-        Serial.println(value);
+        commandOutput->println(value);
     }
 }
 
@@ -860,9 +1016,10 @@ static void startClockJob(const String &line)
 
     String sourceArgs = parts[0];
     String sourceName = nextToken(sourceArgs);
+    sourceName.toLowerCase();
     if (sourceName != "clock")
     {
-        Serial.println(F("ERROR: pipeline source must start with clock"));
+        commandOutput->println(F("ERROR: pipeline source must start with clock"));
         return;
     }
 
@@ -877,15 +1034,15 @@ static void startClockJob(const String &line)
     {
         if (stageCount >= 8)
         {
-            Serial.println(F("ERROR: pipeline too long"));
+            commandOutput->println(F("ERROR: pipeline too long"));
             return;
         }
         Stage stage;
         if (!parsePipelineStage(parts[i], stage))
         {
-            Serial.print(F("ERROR: unsupported pipeline stage '"));
-            Serial.print(parts[i]);
-            Serial.println(F("'"));
+            commandOutput->print(F("ERROR: unsupported pipeline stage '"));
+            commandOutput->print(parts[i]);
+            commandOutput->println(F("'"));
             return;
         }
         if (stage.kind == STAGE_WRITE || stage.kind == STAGE_PRINT)
@@ -909,7 +1066,7 @@ static void startClockJob(const String &line)
 
     if (!hasSink)
     {
-        Serial.println(F("ERROR: clock pipeline requires write PIN or print sink"));
+        commandOutput->println(F("ERROR: clock pipeline requires write PIN or print sink"));
         return;
     }
 
@@ -927,13 +1084,13 @@ static void startClockJob(const String &line)
             {
                 jobs[i].stages[s] = parsedStages[s];
             }
-            Serial.print(F("Started job "));
-            Serial.println(i + 1);
+            commandOutput->print(F("Started job "));
+            commandOutput->println(i + 1);
             return;
         }
     }
 
-    Serial.println(F("ERROR: no free jobs"));
+    commandOutput->println(F("ERROR: no free jobs"));
 }
 
 static void handleCommand(const String &line)
@@ -948,6 +1105,7 @@ static void handleCommand(const String &line)
     {
         String source = commandLine;
         String sourceName = nextToken(source);
+        sourceName.toLowerCase();
         if (sourceName == "clock")
         {
             startClockJob(commandLine);
@@ -960,6 +1118,7 @@ static void handleCommand(const String &line)
     }
 
     String command = nextToken(commandLine);
+    command.toLowerCase();
     if (command == "help")
     {
         printHelp();
@@ -988,7 +1147,7 @@ static void handleCommand(const String &line)
             jobs[i].stageCount = 0;
             jobs[i].pipeline = "";
         }
-        Serial.println(F("reset"));
+        commandOutput->println(F("reset"));
         return;
     }
     if (command == "read")
@@ -1073,13 +1232,13 @@ static void handleCommand(const String &line)
     }
     if (command == "status")
     {
-        Serial.println(F("ESP8266 Commandware ready"));
+        commandOutput->println(F("ESP8266 Commandware ready"));
         return;
     }
 
-    Serial.print(F("ERROR: unknown command '"));
-    Serial.print(command);
-    Serial.println(F("'"));
+    commandOutput->print(F("ERROR: unknown command '"));
+    commandOutput->print(command);
+    commandOutput->println(F("'"));
 }
 
 void setup()
@@ -1088,6 +1247,19 @@ void setup()
     delay(1000);
     Serial.println(F("Commandware ESP-12E ready"));
     Serial.println(F("Type 'help' for commands"));
+
+    configureWebServer();
+    WiFi.mode(WIFI_STA);
+    if (WIFI_SSID[0] != '\0')
+    {
+        WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+        lastWifiAttempt = millis();
+        Serial.println(F("Connecting to Wi-Fi..."));
+    }
+    else
+    {
+        Serial.println(F("Set WIFI_SSID and WIFI_PASSWORD in the sketch to enable web access."));
+    }
 
     // Do not manipulate boot-sensitive pins: GPIO0, GPIO2, GPIO15.
     // GPIO1 and GPIO3 are UART, and GPIO16 is safe but not always usable as output.
@@ -1108,6 +1280,8 @@ void setup()
 
 void loop()
 {
+    serviceWebServer();
+
     while (Serial.available())
     {
         char ch = Serial.read();

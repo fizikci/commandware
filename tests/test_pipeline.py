@@ -11,6 +11,12 @@ def test_not_inverts_values():
     assert result == [1, 0, 1, 0]
 
 
+def test_command_names_are_case_insensitive():
+    assert run_stream("NOT", [0, 1]) == [1, 0]
+    commands = parse_pipeline("CLOCK 100 | WRITE 5")
+    assert [cmd.name for cmd in commands] == ["clock", "write"]
+
+
 def test_rising_only_emits_edges():
     result = run_stream("rising", [0, 0, 1, 1, 0, 0])
     assert result == [1]

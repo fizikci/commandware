@@ -49,6 +49,37 @@ Monitor the serial console:
 arduino-cli monitor -p COM3 --config baudrate=115200
 ```
 
+## ESP8266 web interface
+
+The firmware can join an existing Wi-Fi network and expose the command shell to
+devices on that same network. Before compiling, set `WIFI_SSID` and
+`WIFI_PASSWORD` near the top of
+[the firmware sketch](firmware/esp12e_commandware/esp12e_commandware.ino).
+Upload the sketch and check the serial monitor for the board's IP address, then
+open `http://<board-ip>/` on your phone or browser.
+
+The page accepts the same commands as the serial shell. Commands can also be
+submitted directly with an HTTP POST:
+
+```bash
+curl --data-urlencode "command=read 4" http://<board-ip>/api/command
+```
+
+The endpoint accepts a form field named `command` and returns command output as
+plain text. The web interface has no authentication; use it only on a trusted
+Wi-Fi network and do not expose it to the public internet. Do not commit real
+Wi-Fi credentials to a shared repository.
+
+The page has one editable command field with suggestions for common GPIO
+commands. Successfully run commands are saved in a newest-first history on that
+browser (up to 12 commands), so they can be selected and run again. The
+running-jobs list refreshes every three seconds and provides a Kill button for
+each job.
+
+Command names are case-insensitive, including pipeline sources and stages. For
+example, `READ 4`, `NOT 0`, and `CLOCK 100 | WRITE 5` work the same as their
+lowercase forms.
+
 ## Supported commands
 
 - read
