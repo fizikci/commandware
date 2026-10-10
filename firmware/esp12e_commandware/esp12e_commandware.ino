@@ -51,12 +51,18 @@ static const char WEB_PAGE[] PROGMEM = R"rawliteral(
     header p { margin: .2rem 0 0; color: #93a4bc; font-size: .9rem; }
     section { margin-top: 1rem; padding: 1rem; border: 1px solid #26344a; border-radius: 1rem; background: #111b2d; }
     label { display: block; margin: .9rem 0 .35rem; color: #aebed3; font-size: .82rem; font-weight: 650; }
-    input, select, button { min-height: 3rem; border: 1px solid #34445d; border-radius: .7rem; font: inherit; }
-    input, select { width: 100%; padding: 0 .8rem; background: #0b1424; color: #edf4ff; }
-    select { margin-bottom: .2rem; }
+    input, button { min-height: 3rem; border: 1px solid #34445d; border-radius: .7rem; font: inherit; }
+    input { width: 100%; padding: 0 .8rem; background: #0b1424; color: #edf4ff; }
     #command-form { margin-top: .9rem; }
     .command-row { display: flex; align-items: stretch; gap: .55rem; }
-    .command-row input { min-width: 0; flex: 1; }
+    .command-entry { position: relative; min-width: 0; flex: 1; }
+    #command { padding-right: 3rem; }
+    #command-action { position: absolute; top: .25rem; right: .25rem; width: 2.5rem; min-height: 2.5rem; padding: 0; border: 0; background: transparent; color: #93a4bc; font-size: 1.25rem; }
+    #command-action:active { background: #26344a; }
+    .suggestions { position: absolute; z-index: 2; top: calc(100% + .35rem); right: 0; left: 0; max-height: 14rem; overflow-y: auto; padding: .3rem; border: 1px solid #34445d; border-radius: .7rem; background: #111b2d; box-shadow: 0 .7rem 1.5rem #0008; }
+    .suggestions[hidden] { display: none; }
+    .suggestions button { display: block; width: 100%; min-height: 2.7rem; padding: .45rem .6rem; border: 0; border-radius: .45rem; background: transparent; color: #dbeafe; text-align: left; font-size: .9rem; overflow-wrap: anywhere; }
+    .suggestions button:active, .suggestions button:focus { background: #26344a; }
     button { padding: 0 .95rem; background: #2563eb; border-color: #3b82f6; color: white; font-weight: 700; cursor: pointer; touch-action: manipulation; }
     button:active { background: #1d4ed8; }
     button:disabled { opacity: .55; cursor: wait; }
@@ -65,18 +71,20 @@ static const char WEB_PAGE[] PROGMEM = R"rawliteral(
     #jobs-list li { display: flex; align-items: center; justify-content: space-between; gap: .6rem; min-width: 0; padding: .7rem; border: 1px solid #26344a; border-radius: .7rem; background: #0b1424; color: #c6d5e8; font-size: .88rem; overflow-wrap: anywhere; }
     #jobs-list button { min-height: 2.4rem; flex: 0 0 auto; padding: 0 .7rem; border-color: #7f3441; background: #451923; color: #fecdd3; font-size: .82rem; }
     #jobs-list button:active { background: #672331; }
-    @media (max-width: 360px) { body { padding-right: .75rem; padding-left: .75rem; } section { padding: .8rem; } .command-row { gap: .4rem; } .command-row button { padding: 0 .7rem; } }
+    @media (max-width: 360px) { body { padding-right: .75rem; padding-left: .75rem; } section { padding: .8rem; } .command-row { gap: .4rem; } .command-row > button { padding: 0 .7rem; } }
   </style>
 </head>
 <body>
-  <header><h1>Commandware</h1><p>ESP8266 control panel</p></header>
+  <header><h1>Commandware</h1><p>Change your ESP8266 behavior with commands</p></header>
   <main>
     <section aria-label="Command console">
       <form id="command-form">
-        <label for="command">Command · type or choose a suggestion</label>
         <div class="command-row">
-          <input id="command" name="command" list="command-suggestions" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="e.g. read 4" required>
-          <datalist id="command-suggestions"></datalist>
+          <div class="command-entry">
+            <input id="command" name="command" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="e.g. read 4" required aria-autocomplete="list" aria-controls="command-suggestions" aria-expanded="false">
+            <button id="command-action" type="button" aria-label="Show command suggestions" aria-expanded="false">▾</button>
+            <div id="command-suggestions" class="suggestions" role="listbox" hidden></div>
+          </div>
           <button type="submit">Run</button>
         </div>
       </form>
@@ -88,13 +96,14 @@ static const char WEB_PAGE[] PROGMEM = R"rawliteral(
     </section>
   </main>
   <script>
-    const f=document.getElementById('command-form'),i=document.getElementById('command'),r=document.getElementById('result'),d=document.getElementById('command-suggestions'),j=document.getElementById('jobs-list'),k='commandware-history',p=['write 4 1','write 4 0','write 4 1 100','read 4','read 5','read 12','adc A0','clock 500 | write 5'];let busy=false;
-    function history(){try{const h=JSON.parse(localStorage.getItem(k)||'[]');return Array.isArray(h)?h.filter(x=>typeof x==='string'):[]}catch(e){console.error('Unable to load command history:',e);return[]}}
-    function suggestions(){const h=history();d.replaceChildren(...[...h,...p.filter(c=>!h.includes(c))].map(c=>{const o=document.createElement('option');o.value=c;return o}))}
-    function remember(c){try{localStorage.setItem(k,JSON.stringify([c,...history().filter(x=>x!==c)].slice(0,12)));suggestions()}catch(e){console.error('Unable to save command history:',e)}}
+    const f=document.getElementById('command-form'),i=document.getElementById('command'),r=document.getElementById('result'),d=document.getElementById('command-suggestions'),a=document.getElementById('command-action'),j=document.getElementById('jobs-list'),p=['help','write 4 1','write 4 0','write 4 1 100','read 4','read 5','read 12','adc A0','clock 500 | write 5'];let h=[],busy=false;
+    function suggestions(){const all=[...h,...p.filter(c=>!h.includes(c))],query=i.value.trim().toLowerCase(),matches=query?all.filter(c=>c.toLowerCase().includes(query)):all;d.replaceChildren(...matches.map(c=>{const b=document.createElement('button');b.type='button';b.textContent=c;b.setAttribute('role','option');b.onclick=()=>{i.value=c;closeSuggestions();i.focus()};return b}));if(!matches.length){const empty=document.createElement('div');empty.textContent='No matching commands';empty.style.cssText='padding:.5rem;color:#93a4bc;font-size:.85rem';d.append(empty)}}
+    function openSuggestions(){suggestions();d.hidden=false;a.textContent=i.value?'×':'▾';a.setAttribute('aria-label',i.value?'Clear command':'Show command suggestions');a.setAttribute('aria-expanded','true');i.setAttribute('aria-expanded','true')}
+    function closeSuggestions(){d.hidden=true;a.textContent=i.value?'×':'▾';a.setAttribute('aria-label',i.value?'Clear command':'Show command suggestions');a.setAttribute('aria-expanded','false');i.setAttribute('aria-expanded','false')}
+    function remember(c){h=[c,...h.filter(x=>x!==c)].slice(0,12);if(!d.hidden)suggestions()}
     async function send(c){const x=await fetch('/api/command',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({command:c})}),t=await x.text();if(!x.ok)throw Error(t||x.statusText);return t}
     async function refresh(){if(busy)return;busy=true;try{const t=await send('jobs'),a=t.split(/\r?\n/).map(s=>s.match(/^(\d+)\s+RUNNING\s+(.*)$/)).filter(Boolean);j.replaceChildren();if(!a.length){j.textContent='No jobs running.';return}a.forEach(m=>{const li=document.createElement('li'),b=document.createElement('button');li.append(document.createTextNode(`#${m[1]} ${m[2]} `));b.textContent='Kill';b.onclick=async()=>{b.disabled=true;try{r.textContent=await send(`kill ${m[1]}`);await refresh()}catch(e){r.textContent=`Request failed: ${e}`;b.disabled=false}};li.append(b);j.append(li)})}catch(e){j.textContent=`Unable to load jobs: ${e}`}finally{busy=false}}
-    f.onsubmit=async e=>{e.preventDefault();const c=i.value.trim();r.textContent='Running...';try{r.textContent=await send(c);remember(c);await refresh()}catch(x){r.textContent=`Request failed: ${x}`}};suggestions();refresh();setInterval(refresh,3000);
+    a.onclick=()=>{if(i.value)i.value='';openSuggestions();i.focus()};i.onfocus=()=>openSuggestions();i.oninput=()=>openSuggestions();document.addEventListener('click',e=>{if(!e.target.closest('.command-entry'))closeSuggestions()});document.addEventListener('keydown',e=>{if(e.key==='Escape')closeSuggestions()});f.onsubmit=async e=>{e.preventDefault();const c=i.value.trim();r.textContent='Running...';closeSuggestions();try{r.textContent=await send(c);remember(c);await refresh()}catch(x){r.textContent=`Request failed: ${x}`}};closeSuggestions();refresh();setInterval(refresh,3000);
   </script>
 </body>
 </html>
