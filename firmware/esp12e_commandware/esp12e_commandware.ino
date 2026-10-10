@@ -303,7 +303,7 @@ static void printHelp()
     commandOutput->println(F("read PIN"));
     commandOutput->println(F("write PIN VALUE [DURATION_MS]"));
     commandOutput->println(F("adc A0"));
-    commandOutput->println(F("clock MS [PIN]"));
+    commandOutput->println(F("clock HZ [PIN]"));
     commandOutput->println(F("map IN_MIN IN_MAX OUT_MIN OUT_MAX VALUE"));
     commandOutput->println(F("not VALUE"));
     commandOutput->println(F("edge VALUE"));
@@ -1032,7 +1032,14 @@ static void startClockJob(const String &line)
         return;
     }
 
-    int interval = max(1, toIntDef(nextToken(sourceArgs), 100));
+    String frequencyToken = nextToken(sourceArgs);
+    float frequency = frequencyToken.toFloat();
+    if (frequencyToken.length() == 0 || frequency < 0.01f || frequency > 1000000.0f)
+    {
+        commandOutput->println(F("ERROR: clock frequency must be between 0.01 and 1000000 Hz"));
+        return;
+    }
+    unsigned long halfPeriod = max(1UL, (unsigned long)(500000.0f / frequency + 0.5f));
     int fallbackPin = toIntDef(nextToken(sourceArgs), -1);
 
     Stage parsedStages[8];
@@ -1084,8 +1091,8 @@ static void startClockJob(const String &line)
         if (!jobs[i].active)
         {
             jobs[i].active = true;
-            jobs[i].interval = interval;
-            jobs[i].next = millis() + jobs[i].interval;
+            jobs[i].interval = halfPeriod;
+            jobs[i].next = micros() + jobs[i].interval;
             jobs[i].clockState = 0;
             jobs[i].stageCount = stageCount;
             jobs[i].pipeline = trim(line);
@@ -1324,7 +1331,7 @@ void loop()
         {
             continue;
         }
-        if (now >= jobs[i].next)
+        if ((long)(micros() - jobs[i].next) >= 0)
         {
             jobs[i].clockState = jobs[i].clockState == 0 ? 1 : 0;
             int value = jobs[i].clockState;

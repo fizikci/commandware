@@ -182,10 +182,11 @@ adc A0 --watch | map 0 1023 0 255 | print
 Generate alternating 0/1 values.
 
 ```bash
-clock 100
+clock 500
 ```
 
-means toggle every 100 ms:
+The argument is a frequency in hertz, not a toggle interval. `clock 500`
+toggles every 1 ms, producing a nominal 500 Hz square wave:
 
 ```text
 0
@@ -198,12 +199,19 @@ means toggle every 100 ms:
 Example:
 
 ```bash
-clock 100 | write 5
+clock 500 | write 5
 ```
 
 GPIO5 becomes a square wave.
 
 Timing must be **non-blocking**. Do not implement it with long `delay()` calls.
+The ESP8266 firmware uses microsecond scheduling and accepts frequencies from
+0.01 to 1,000,000 Hz, with half-periods rounded to the nearest microsecond
+(minimum 1 microsecond). This is the accepted command range, not a guarantee
+that software-driven GPIO output can reach every requested frequency: loop and
+`digitalWrite` overhead constrain actual output, particularly at high
+frequencies. The previous 500 Hz ceiling was imposed by the firmware's
+millisecond scheduler, not by the ESP8266 itself.
 
 ---
 

@@ -98,3 +98,12 @@ lowercase forms.
 - write
 - print
 - shiftout
+
+`clock HZ [PIN]` generates an alternating 0/1 signal at the requested
+frequency. For example, `clock 500 | write 5` toggles GPIO5 every millisecond,
+producing a nominal 500 Hz square wave. The firmware accepts values from
+0.01 to 1,000,000 Hz and schedules toggles with microsecond timing. This is an
+input range, not a guarantee that the software-driven GPIO output can reach
+every requested frequency: loop and `digitalWrite` overhead limit the actual
+output rate, especially at the high end. The ESP8266 itself does not impose the
+old 500 Hz limit; that came from the firmware's former millisecond scheduler.
