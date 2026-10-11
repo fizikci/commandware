@@ -32,6 +32,9 @@ pip-wheel-metadata/
 *.bin
 *.map
 
+# Local Wi-Fi credentials (copy wifi_config.example.h to this path).
+/firmware/esp12e_commandware/wifi_config.h
+
 # Editor/OS files
 .vscode/
 .idea/

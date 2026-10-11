@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import shlex
-from math import exp, isfinite, log
+import re
+import heapq
+from math import ceil, exp, isfinite, log
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
@@ -49,6 +51,55 @@ def _scale(value: object, in_min: int, in_max: int, out_min: int, out_max: int) 
 class Command:
     name: str
     args: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ScheduleEntry:
+    start_ms: int
+    pipeline: str
+
+
+def _milliseconds(token: str, allow_zero: bool = False) -> int:
+    if not re.fullmatch(r"[0-9]+", token) or not (0 if allow_zero else 1) <= int(token) <= 2147483647:
+        raise ValueError("milliseconds must be an integer in the supported range")
+    return int(token)
+
+
+def parse_schedule(text: str) -> list[ScheduleEntry]:
+    match = re.fullmatch(r"\s*schedule\s*\{(.*)\}\s*", text, re.I | re.S)
+    if not match:
+        raise ValueError("schedule requires { START_MS { COMMAND } ... }")
+    body = match[1]
+    entries = []
+    while body.strip():
+        entry = re.match(r"\s*([0-9]+)\s*\{([^{}]+)\}", body, re.S)
+        if not entry or not entry[2].strip():
+            raise ValueError("invalid schedule entry")
+        entries.append(ScheduleEntry(_milliseconds(entry[1], True), entry[2].strip()))
+        body = body[entry.end():]
+    if not 1 <= len(entries) <= 32:
+        raise ValueError("schedule requires 1..32 entries")
+    return entries
+
+
+def _clock_options(args: list[str]) -> tuple[float, int | None, int | None]:
+    if not args:
+        raise ValueError("clock requires a frequency")
+    frequency = float(args[0])
+    if not isfinite(frequency) or not 0.01 <= frequency <= 1000000:
+        raise ValueError("clock frequency must be between 0.01 and 1000000 Hz")
+    duration = pin = None
+    remaining = iter(args[1:])
+    for token in remaining:
+        if token == "--dur" and duration is None:
+            duration = _milliseconds(next(remaining, ""))
+        elif pin is None and token != "--dur":
+            pin = _milliseconds(token, True)
+            if pin > 16:
+                raise ValueError("invalid clock pin")
+        else:
+            raise ValueError("invalid clock argument")
+    return frequency, duration, pin
 
 
 @dataclass
@@ -249,6 +300,13 @@ def _ohm(args: list[str], hardware: HardwareState, values: Sequence[object]) -> 
 
 
 def _clock(args: list[str], values: Sequence[object] | None = None, count: int | None = None) -> list[int]:
+    frequency, duration, _ = _clock_options(args)
+    if duration is not None:
+        half_period_us = max(1, int(500000 / frequency + 0.5))
+        total = max(0, ceil(duration * 1000 / half_period_us) - 1)
+        if count is not None:
+            total = min(total, max(0, count))
+        return [(index + 1) % 2 for index in range(total)]
     total = count if count is not None else (len(values) if values is not None else 1)
     if total is None or total <= 0:
         total = 1
@@ -401,7 +459,7 @@ def _shiftout(args: list[str], hardware: HardwareState, values: Sequence[object]
 
 def _system_help(_args: list[str], _values: Sequence[object] | None = None, **_: object) -> list[str]:
     return [
-        "help", "pins", "jobs", "kill", "status", "reset", "run",
+        "help", "pins", "jobs", "kill", "status", "reset", "run", "schedule",
         "read", "write", "adc", "ohm", "clock", "map", "not", "edge",
         "rising", "falling", "debounce", "toggle", "divide", "pulse",
         "print", "shiftin", "shiftout"
@@ -490,10 +548,118 @@ def _dispatch(command: Command, values: Sequence[object], hardware: HardwareStat
     return handler(command.args, values, hardware=hardware, jobs=jobs, job_id=job_id, count=count)
 
 
+def _simulate_schedule(entries: list[ScheduleEntry], hardware: HardwareState, jobs: JobManager | None, count: int | None) -> list[object]:
+    """Run concurrent jobs on a virtual microsecond timeline, without sleeping.
+
+    Unlimited clocks retain the simulator's bounded sampling behavior (one
+    sample by default); firmware clocks actually run until killed.
+    """
+    prepared = []
+    events = []
+    output = []
+    allowed = set(COMMANDS) - {"run", "reset", "kill", "jobs"}
+    for index, entry in enumerate(entries):
+        commands = parse_pipeline(entry.pipeline)
+        if any(not part.strip() for part in entry.pipeline.split("|")):
+            raise ValueError("empty pipeline stage")
+        if not commands or any(c.name not in allowed for c in commands):
+            raise ValueError("unsupported scheduled command")
+        frequency = duration = pin = None
+        pins = set()
+        if commands[0].name == "clock":
+            frequency, duration, pin = _clock_options(commands[0].args)
+            if duration is not None and entry.start_ms + duration > 2147483647:
+                raise ValueError("schedule deadline exceeds supported range")
+            if any(c.name not in {"map", "ohm", "not", "edge", "rising", "falling", "debounce", "toggle", "divide", "pulse", "write", "print"} for c in commands[1:]):
+                raise ValueError("unsupported clock pipeline stage")
+            if pin is not None and not any(c.name in {"write", "print"} for c in commands[1:]):
+                commands.append(Command("write", [str(pin)]))
+            if len(commands) > 9:
+                raise ValueError("pipeline too long")
+            pins = {int(parse_pin(c.args[0])) for c in commands[1:] if c.name == "write"}
+            for previous in prepared:
+                old, _, old_duration, old_pins, *_ = previous
+                if pins & old_pins and entry.start_ms < (old.start_ms + old_duration if old_duration else float("inf")) and old.start_ms < (entry.start_ms + duration if duration else float("inf")):
+                    raise ValueError("overlapping clock writes to the same pin")
+            for gpio in pins:
+                if gpio in hardware.pin_owners:
+                    raise ValueError(f"GPIO{gpio} is owned by job {hardware.pin_owners[gpio]}")
+        interval = max(1, int(500000 / frequency + 0.5)) if frequency else None
+        prepared.append((entry, commands, duration, pins, interval, [{} for _ in commands]))
+        heapq.heappush(events, (entry.start_ms * 1000, 1, index, 0))
+        if duration is not None:
+            heapq.heappush(events, ((entry.start_ms + duration) * 1000, 0, index, 0))
+    clocks = [p for p in prepared if p[4] is not None]
+    for entry, *_ in clocks:
+        if sum(other.start_ms <= entry.start_ms and (duration is None or entry.start_ms < other.start_ms + duration)
+               for other, _, duration, *_ in clocks) > 8:
+            raise ValueError("schedule exceeds 8 concurrent clocks")
+    owners = {}
+    while events:
+        time_us, kind, index, tick = heapq.heappop(events)
+        entry, commands, duration, pins, interval, states = prepared[index]
+        if kind == 0:
+            for pin in pins:
+                hardware.set_gpio(pin, 0)
+                hardware.release_pin(pin, owners[index])
+            if jobs is not None and index in owners:
+                jobs.kill(owners[index])
+            continue
+        if kind == 1:
+            if interval is None:
+                output.extend(run_stream(entry.pipeline, hardware=hardware, jobs=jobs, count=count))
+                continue
+            owner = jobs.create(entry.pipeline, pins).id if jobs is not None else index + 1
+            owners[index] = owner
+            for pin in pins:
+                hardware.claim_pin(pin, owner)
+                hardware.set_gpio(pin, 0)
+        else:
+            stream = [tick % 2]
+            for stage_index, stage in enumerate(commands[1:], 1):
+                state = states[stage_index]
+                if not stream:
+                    break
+                value = stream[0]
+                previous = state.get("previous")
+                state["previous"] = value
+                state["count"] = state.get("count", 0) + 1
+                if stage.name in {"edge", "rising", "falling"}:
+                    emit = (previous is None or value != previous) if stage.name == "edge" else previous is not None and (value > previous if stage.name == "rising" else value < previous)
+                    stream = [value] if emit else []
+                elif stage.name == "toggle":
+                    state["toggle"] = 1 - state.get("toggle", 0)
+                    stream = [state["toggle"]]
+                elif stage.name == "divide":
+                    divisor = max(1, int(stage.args[0])) if stage.args else 2
+                    stream = stream if state["count"] % divisor == 0 else []
+                elif stage.name == "debounce":
+                    state["streak"] = state.get("streak", 0) + 1 if previous == value else 1
+                    threshold = max(1, int(stage.args[0])) if stage.args else 1
+                    stream = stream if state["streak"] >= threshold else []
+                elif stage.name == "pulse":
+                    length = max(1, int(stage.args[0])) if stage.args else 1
+                    stream = [1] * length if value == 1 and previous in {None, 0} else []
+                else:
+                    stream = _dispatch(stage, stream, hardware, jobs, owners[index])
+            output.extend(stream)
+        next_tick = tick + 1
+        next_time = entry.start_ms * 1000 + next_tick * interval
+        limit = count if count is not None else (1 if duration is None else None)
+        if (limit is None or next_tick <= limit) and (duration is None or next_time < (entry.start_ms + duration) * 1000):
+            heapq.heappush(events, (next_time, 2, index, next_tick))
+    return output
+
+
 def run_stream(command: str, values: Sequence[object] | None = None, hardware: HardwareState | None = None, jobs: JobManager | None = None, count: int | None = None, job_id: int | None = None) -> list[object]:
     hardware = hardware or HardwareState()
     if not command or not command.strip():
         return []
+    if re.match(r"\s*schedule\b", command, re.I):
+        return _simulate_schedule(parse_schedule(command), hardware, jobs, count)
+    commands = parse_pipeline(command)
+    if commands and commands[0].name == "clock" and _clock_options(commands[0].args)[1] is not None:
+        return _simulate_schedule([ScheduleEntry(0, command)], hardware, jobs, count)
     if "|" in command:
         pipeline = Pipeline(parse_pipeline(command))
         return pipeline.execute(values, hardware=hardware, jobs=jobs, job_id=job_id)

@@ -77,6 +77,23 @@ clock 100 | divide 10 | write 5
 
 # 3. Values and Streams
 
+Clock sources run indefinitely unless given `--dur MILLISECONDS`. Duration
+belongs to the source; completion stops its pipeline and drives output pins low.
+Scheduling controls only when commands start, relative to one shared timeline:
+
+```text
+schedule {
+    1000 { clock 1000 --dur 500 | write 15 }
+    1500 { clock 1400 --dur 1000 | write 15 }
+}
+```
+
+Entries run independently, with up to 32 pending commands and eight concurrent
+clocks. Future entries acquire execution slots only when they start.
+Overlapping clock writers on one pin are rejected; adjacent
+notes release the pin before the next note begins. Both serial and web input
+accept multiline blocks, and queued entries can be cancelled with `kill ID`.
+
 Internally, pipelines operate on events.
 
 Conceptually:

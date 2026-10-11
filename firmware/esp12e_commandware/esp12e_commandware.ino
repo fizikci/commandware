@@ -1,12 +1,24 @@
 #include <Arduino.h>
 #include <math.h>
+#include <new>
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
 
-struct Stage;
+// Credentials stay in a local, Git-ignored header. Fresh checkouts still
+// compile and provide the serial console with Wi-Fi disabled.
+#if __has_include("wifi_config.h")
+#include "wifi_config.h"
+#else
+#include "wifi_config.example.h"
+#endif
 
-static const char *WIFI_SSID = "KESKIN";
-static const char *WIFI_PASSWORD = "";
+struct Stage;
+struct Job;
+struct ScheduledCommand;
+struct ClockWindow;
+
+static const char *WIFI_SSID = COMMANDWARE_WIFI_SSID;
+static const char *WIFI_PASSWORD = COMMANDWARE_WIFI_PASSWORD;
 static const unsigned long WIFI_RETRY_INTERVAL = 15000;
 
 static ESP8266WebServer webServer(80);
@@ -52,8 +64,8 @@ static const char WEB_PAGE[] PROGMEM = R"rawliteral(
     header p { margin: .2rem 0 0; color: #93a4bc; font-size: .9rem; }
     section { margin-top: 1rem; padding: 1rem; border: 1px solid #26344a; border-radius: 1rem; background: #111b2d; }
     label { display: block; margin: .9rem 0 .35rem; color: #aebed3; font-size: .82rem; font-weight: 650; }
-    input, button { min-height: 3rem; border: 1px solid #34445d; border-radius: .7rem; font: inherit; }
-    input { width: 100%; padding: 0 .8rem; background: #0b1424; color: #edf4ff; }
+    textarea, button { min-height: 3rem; border: 1px solid #34445d; border-radius: .7rem; font: inherit; }
+    textarea { resize: vertical; min-height: 6rem; padding-top: .65rem; width: 100%; padding: 0 .8rem; background: #0b1424; color: #edf4ff; }
     #command-form { margin-top: .9rem; }
     .command-row { display: flex; align-items: stretch; gap: .55rem; }
     .command-entry { position: relative; min-width: 0; flex: 1; }
@@ -82,7 +94,7 @@ static const char WEB_PAGE[] PROGMEM = R"rawliteral(
       <form id="command-form">
         <div class="command-row">
           <div class="command-entry">
-            <input id="command" name="command" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="e.g. read 4" required aria-autocomplete="list" aria-controls="command-suggestions" aria-expanded="false">
+            <textarea rows="3" id="command" name="command" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="e.g. read 4" required aria-autocomplete="list" aria-controls="command-suggestions" aria-expanded="false"></textarea>
             <button id="command-action" type="button" aria-label="Show command suggestions" aria-expanded="false">▾</button>
             <div id="command-suggestions" class="suggestions" role="listbox" hidden></div>
           </div>
@@ -97,7 +109,7 @@ static const char WEB_PAGE[] PROGMEM = R"rawliteral(
     </section>
   </main>
   <script>
-    const f=document.getElementById('command-form'),i=document.getElementById('command'),r=document.getElementById('result'),d=document.getElementById('command-suggestions'),a=document.getElementById('command-action'),j=document.getElementById('jobs-list'),p=['help','write 4 1','write 4 0','write 4 1 100','read 4','read 5','read 12','adc A0','ohm A0','status','clock 500 | write 5'];let h=[],busy=false;
+    const f=document.getElementById('command-form'),i=document.getElementById('command'),r=document.getElementById('result'),d=document.getElementById('command-suggestions'),a=document.getElementById('command-action'),j=document.getElementById('jobs-list'),p=['help','write 4 1','write 4 0','write 4 1 100','read 4','read 5','read 12','adc A0','ohm A0','status','clock 500 | write 5','clock 1000 --dur 500 | write 15','schedule { 1000 { clock 1000 --dur 500 | write 15 } 1500 { clock 1400 --dur 1000 | write 15 } }'];let h=[],busy=false;
     function suggestions(){const all=[...h,...p.filter(c=>!h.includes(c))],query=i.value.trim().toLowerCase(),matches=query?all.filter(c=>c.toLowerCase().includes(query)):all;d.replaceChildren(...matches.map(c=>{const b=document.createElement('button');b.type='button';b.textContent=c;b.setAttribute('role','option');b.onclick=()=>{i.value=c;closeSuggestions();i.focus()};return b}));if(!matches.length){const empty=document.createElement('div');empty.textContent='No matching commands';empty.style.cssText='padding:.5rem;color:#93a4bc;font-size:.85rem';d.append(empty)}}
     function openSuggestions(){suggestions();d.hidden=false;a.textContent=i.value?'×':'▾';a.setAttribute('aria-label',i.value?'Clear command':'Show command suggestions');a.setAttribute('aria-expanded','true');i.setAttribute('aria-expanded','true')}
     function closeSuggestions(){d.hidden=true;a.textContent=i.value?'×':'▾';a.setAttribute('aria-label',i.value?'Clear command':'Show command suggestions');a.setAttribute('aria-expanded','false');i.setAttribute('aria-expanded','false')}
@@ -199,7 +211,12 @@ struct Stage
 
 struct Job
 {
+    unsigned long id = 0;
     bool active = false;
+    bool started = false;
+    bool isClock = true;
+    unsigned long startMs = 0;
+    unsigned long durationMs = 0; // Zero means unlimited.
     unsigned long interval = 0;
     unsigned long next = 0;
     int clockState = 0;
@@ -209,7 +226,28 @@ struct Job
 };
 
 static Job jobs[8];
+static const int MAX_SCHEDULED_COMMANDS = 32;
+struct ScheduledCommand
+{
+    unsigned long id = 0;
+    unsigned long startMs = 0;
+    unsigned long durationMs = 0;
+    unsigned long pinMask = 0;
+    bool isClock = false;
+    String pipeline;
+};
+static ScheduledCommand scheduled[MAX_SCHEDULED_COMMANDS];
+static unsigned long nextJobId = 1;
+
+struct ClockWindow
+{
+    unsigned long startMs = 0;
+    unsigned long durationMs = 0;
+    unsigned long pinMask = 0;
+    bool active = false;
+};
 static String inputBuffer;
+static int inputBraceDepth = 0;
 
 struct PendingWritePulse
 {
@@ -229,6 +267,8 @@ struct SignalState
     int divideCounter = 0;
     int pulseRemaining = 0;
 };
+
+static void stopJob(Job &job);
 
 static SignalState directEdgeState;
 static SignalState directRisingState;
@@ -259,9 +299,11 @@ static String nextToken(String &input)
         input = "";
         return "";
     }
-    int idx = trimmed.indexOf(' ');
+    int idx = 0;
+    while (idx < (int)trimmed.length() && trimmed[idx] != ' ' && trimmed[idx] != '\t' && trimmed[idx] != '\r' && trimmed[idx] != '\n')
+        ++idx;
     String token;
-    if (idx < 0)
+    if (idx == (int)trimmed.length())
     {
         token = trimmed;
         input = "";
@@ -308,7 +350,8 @@ static void printHelp()
     commandOutput->println(F("adc A0"));
     commandOutput->println(F("ohm [A0] (ohms, <270, >700k, OUT_OF_RANGE)"));
     commandOutput->println(F("adc A0 | ohm (terminal measurement stage)"));
-    commandOutput->println(F("clock HZ [PIN]"));
+    commandOutput->println(F("clock HZ [PIN] [--dur MILLISECONDS]"));
+    commandOutput->println(F("schedule { START_MS { COMMAND | STAGE } ... }"));
     commandOutput->println(F("map IN_MIN IN_MAX OUT_MIN OUT_MAX VALUE"));
     commandOutput->println(F("not VALUE"));
     commandOutput->println(F("edge VALUE"));
@@ -352,10 +395,17 @@ static void printJobs()
         {
             continue;
         }
-        commandOutput->print(i + 1);
+        commandOutput->print(jobs[i].id);
         commandOutput->print(F(" RUNNING  "));
         commandOutput->println(jobs[i].pipeline);
     }
+    for (int i = 0; i < MAX_SCHEDULED_COMMANDS; ++i)
+        if (scheduled[i].id)
+        {
+            commandOutput->print(scheduled[i].id);
+            commandOutput->print(F(" RUNNING  [queued] "));
+            commandOutput->println(scheduled[i].pipeline);
+        }
 }
 
 static int splitPipeline(const String &line, String parts[], int maxParts)
@@ -930,21 +980,28 @@ static void handleShiftoutCommand(String args)
 static void handleKillCommand(String args)
 {
     int id = toIntDef(nextToken(args), -1);
-    if (id < 1 || id > 8)
+    if (id < 1)
     {
         commandOutput->println(F("ERROR: kill requires valid job id"));
         return;
     }
-    if (!jobs[id - 1].active)
-    {
-        commandOutput->print(F("ERROR: unknown job "));
-        commandOutput->println(id);
-        return;
-    }
-    jobs[id - 1].active = false;
-    jobs[id - 1].stageCount = 0;
-    jobs[id - 1].pipeline = "";
-    commandOutput->print(F("killed "));
+    for (int i = 0; i < 8; ++i)
+        if (jobs[i].active && jobs[i].id == (unsigned long)id)
+        {
+            stopJob(jobs[i]);
+            commandOutput->print(F("killed "));
+            commandOutput->println(id);
+            return;
+        }
+    for (int i = 0; i < MAX_SCHEDULED_COMMANDS; ++i)
+        if (scheduled[i].id == (unsigned long)id)
+        {
+            scheduled[i] = ScheduledCommand();
+            commandOutput->print(F("killed "));
+            commandOutput->println(id);
+            return;
+        }
+    commandOutput->print(F("ERROR: unknown job "));
     commandOutput->println(id);
 }
 
@@ -1076,13 +1133,126 @@ static void runImmediatePipeline(const String &line)
     }
 }
 
-static void startClockJob(const String &line)
+// Restrict deadlines to half the millis() range for rollover-safe comparisons.
+static bool parseMilliseconds(const String &token, unsigned long &value, bool allowZero)
 {
+    if (!token.length()) return false;
+    value = 0;
+    for (unsigned int i = 0; i < token.length(); ++i)
+    {
+        if (token[i] < '0' || token[i] > '9') return false;
+        unsigned int digit = token[i] - '0';
+        if (value > (2147483647UL - digit) / 10) return false;
+        value = value * 10 + digit;
+    }
+    return allowZero || value > 0;
+}
+
+static void stopJob(Job &job)
+{
+    if (job.started && job.isClock)
+    {
+        for (int s = 0; s < job.stageCount; ++s)
+            if (job.stages[s].kind == STAGE_WRITE)
+            {
+                int pin = job.stages[s].p1;
+                pinMode(pin, OUTPUT);
+                digitalWrite(pin, LOW);
+                if (pendingWritePulse.active && pendingWritePulse.pin == pin)
+                    pendingWritePulse.active = false;
+            }
+    }
+    job = Job();
+}
+
+static ClockWindow clockWindow(const Job &job)
+{
+    ClockWindow result;
+    result.active = job.active && job.isClock;
+    result.startMs = job.startMs;
+    result.durationMs = job.durationMs;
+    for (int i = 0; i < job.stageCount; ++i)
+        if (job.stages[i].kind == STAGE_WRITE)
+            result.pinMask |= 1UL << job.stages[i].p1;
+    return result;
+}
+
+static ClockWindow clockWindow(const ScheduledCommand &entry)
+{
+    ClockWindow result;
+    result.active = entry.isClock && entry.pipeline.length();
+    result.startMs = entry.startMs;
+    result.durationMs = entry.durationMs;
+    result.pinMask = entry.pinMask;
+    return result;
+}
+
+static bool windowsConflict(const ClockWindow &a, const ClockWindow &b, unsigned long now)
+{
+    if (!a.active || !b.active || !(a.pinMask & b.pinMask)) return false;
+    int64_t aStart = (long)(a.startMs - now), bStart = (long)(b.startMs - now);
+    int64_t aEnd = a.durationMs ? aStart + a.durationMs : INT64_MAX;
+    int64_t bEnd = b.durationMs ? bStart + b.durationMs : INT64_MAX;
+    return aEnd > bStart && bEnd > aStart;
+}
+
+static bool windowContains(const ClockWindow &window, int64_t offset, unsigned long now)
+{
+    int64_t start = (long)(window.startMs - now);
+    return window.active && start <= offset &&
+        (!window.durationMs || offset < start + window.durationMs);
+}
+
+static ClockWindow plannedWindow(int index, const ScheduledCommand *incoming, int count)
+{
+    if (index < 8) return clockWindow(jobs[index]);
+    index -= 8;
+    if (index < MAX_SCHEDULED_COMMANDS) return clockWindow(scheduled[index]);
+    index -= MAX_SCHEDULED_COMMANDS;
+    return index < count ? clockWindow(incoming[index]) : ClockWindow();
+}
+
+// Validate both GPIO ownership and the eight concurrent execution slots at
+// every start boundary, without reserving one full pipeline per future note.
+static bool validatePlan(const ScheduledCommand *incoming, int count, unsigned long now)
+{
+    int total = 8 + MAX_SCHEDULED_COMMANDS + count;
+    for (int i = 0; i < total; ++i)
+    {
+        ClockWindow a = plannedWindow(i, incoming, count);
+        if (!a.active) continue;
+        int concurrent = 0;
+        int64_t offset = max((int64_t)0, (int64_t)(long)(a.startMs - now));
+        for (int j = 0; j < total; ++j)
+        {
+            ClockWindow b = plannedWindow(j, incoming, count);
+            if (i != j && windowsConflict(a, b, now))
+            {
+                commandOutput->println(F("ERROR: overlapping clock writes to the same pin"));
+                return false;
+            }
+            if (windowContains(b, offset, now)) ++concurrent;
+        }
+        if (concurrent > 8)
+        {
+            commandOutput->println(F("ERROR: schedule exceeds 8 concurrent clocks"));
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool prepareClockJob(const String &line, Job &job)
+{
+    int separators = 0;
+    for (unsigned int i = 0; i < line.length(); ++i)
+        if (line[i] == '|') ++separators;
     String parts[10];
     int partCount = splitPipeline(line, parts, 10);
-    if (partCount <= 0)
+    if (partCount <= 0 || separators != partCount - 1 || partCount > 9)
     {
-        return;
+        commandOutput->println(F("ERROR: invalid or too long clock pipeline"));
+        return false;
     }
 
     String sourceArgs = parts[0];
@@ -1091,18 +1261,48 @@ static void startClockJob(const String &line)
     if (sourceName != "clock")
     {
         commandOutput->println(F("ERROR: pipeline source must start with clock"));
-        return;
+        return false;
     }
 
     String frequencyToken = nextToken(sourceArgs);
-    float frequency = frequencyToken.toFloat();
-    if (frequencyToken.length() == 0 || frequency < 0.01f || frequency > 1000000.0f)
+    char *frequencyEnd;
+    float frequency = strtof(frequencyToken.c_str(), &frequencyEnd);
+    if (*frequencyEnd != '\0' || !isfinite(frequency) || frequencyToken.length() == 0 || frequency < 0.01f || frequency > 1000000.0f)
     {
         commandOutput->println(F("ERROR: clock frequency must be between 0.01 and 1000000 Hz"));
-        return;
+        return false;
     }
     unsigned long halfPeriod = max(1UL, (unsigned long)(500000.0f / frequency + 0.5f));
-    int fallbackPin = toIntDef(nextToken(sourceArgs), -1);
+    int fallbackPin = -1;
+    bool hasDuration = false;
+    while (trim(sourceArgs).length())
+    {
+        String token = nextToken(sourceArgs);
+        if (token == "--dur" && !hasDuration)
+        {
+            if (!parseMilliseconds(nextToken(sourceArgs), job.durationMs, false))
+            {
+                commandOutput->println(F("ERROR: --dur requires 1..2147483647 milliseconds"));
+                return false;
+            }
+            hasDuration = true;
+        }
+        else if (fallbackPin < 0 && token != "--dur")
+        {
+            unsigned long pin;
+            if (!parseMilliseconds(token, pin, true) || pin > 16)
+            {
+                commandOutput->println(F("ERROR: invalid clock argument"));
+                return false;
+            }
+            fallbackPin = (int)pin;
+        }
+        else
+        {
+            commandOutput->println(F("ERROR: invalid clock argument"));
+            return false;
+        }
+    }
 
     Stage parsedStages[8];
     int stageCount = 0;
@@ -1113,7 +1313,7 @@ static void startClockJob(const String &line)
         if (stageCount >= 8)
         {
             commandOutput->println(F("ERROR: pipeline too long"));
-            return;
+            return false;
         }
         Stage stage;
         if (!parsePipelineStage(parts[i], stage))
@@ -1121,7 +1321,12 @@ static void startClockJob(const String &line)
             commandOutput->print(F("ERROR: unsupported pipeline stage '"));
             commandOutput->print(parts[i]);
             commandOutput->println(F("'"));
-            return;
+            return false;
+        }
+        if (stage.kind == STAGE_WRITE && stage.p1 > 16)
+        {
+            commandOutput->println(F("ERROR: invalid clock output pin"));
+            return false;
         }
         if (stage.kind == STAGE_WRITE || stage.kind == STAGE_PRINT)
         {
@@ -1135,6 +1340,8 @@ static void startClockJob(const String &line)
         Stage writeStage;
         writeStage.kind = STAGE_WRITE;
         writeStage.p1 = fallbackPin;
+        writeStage.p2 = -1;
+        writeStage.p3 = -1;
         if (stageCount < 8)
         {
             parsedStages[stageCount++] = writeStage;
@@ -1144,31 +1351,219 @@ static void startClockJob(const String &line)
 
     if (!hasSink)
     {
-        commandOutput->println(F("ERROR: clock pipeline requires write PIN or print sink"));
-        return;
+        if (stageCount == 8)
+        {
+            commandOutput->println(F("ERROR: pipeline too long"));
+            return false;
+        }
+        Stage printStage;
+        printStage.kind = STAGE_PRINT;
+        parsedStages[stageCount++] = printStage;
     }
 
+    job.active = true;
+    job.interval = halfPeriod;
+    job.clockState = 0;
+    job.stageCount = stageCount;
+    job.pipeline = trim(line);
+    for (int s = 0; s < stageCount; ++s)
+        job.stages[s] = parsedStages[s];
+    return true;
+}
+
+static void startClockJob(const String &line)
+{
+    Job job;
+    if (!prepareClockJob(line, job)) return;
+    job.startMs = millis();
+    ScheduledCommand proposed;
+    proposed.pipeline = job.pipeline;
+    proposed.isClock = true;
+    proposed.startMs = job.startMs;
+    proposed.durationMs = job.durationMs;
+    proposed.pinMask = clockWindow(job).pinMask;
+    if (!validatePlan(&proposed, 1, job.startMs)) return;
     for (int i = 0; i < 8; ++i)
-    {
         if (!jobs[i].active)
         {
-            jobs[i].active = true;
-            jobs[i].interval = halfPeriod;
-            jobs[i].next = micros() + jobs[i].interval;
-            jobs[i].clockState = 0;
-            jobs[i].stageCount = stageCount;
-            jobs[i].pipeline = trim(line);
-            for (int s = 0; s < stageCount; ++s)
-            {
-                jobs[i].stages[s] = parsedStages[s];
-            }
+            job.id = nextJobId++;
+            jobs[i] = job;
             commandOutput->print(F("Started job "));
-            commandOutput->println(i + 1);
+            commandOutput->println(job.id);
             return;
         }
-    }
-
     commandOutput->println(F("ERROR: no free jobs"));
+}
+
+static void startSchedule(String text)
+{
+    text = trim(text);
+    if (!text.startsWith("{") || !text.endsWith("}"))
+    {
+        commandOutput->println(F("ERROR: schedule requires { START_MS { COMMAND } ... }"));
+        return;
+    }
+    text = trim(text.substring(1, text.length() - 1));
+    // Store only command text and timing for future notes; compiled stages
+    // occupy the eight execution slots only while their clocks are running.
+    ScheduledCommand *queued = new (std::nothrow) ScheduledCommand[MAX_SCHEDULED_COMMANDS];
+    if (!queued)
+    {
+        commandOutput->println(F("ERROR: not enough memory for schedule"));
+        return;
+    }
+    int count = 0;
+    bool valid = true;
+    while (text.length() && valid)
+    {
+        int open = text.indexOf('{'), close = text.indexOf('}');
+        unsigned long offset;
+        if (count == MAX_SCHEDULED_COMMANDS || open < 0 || close < open ||
+            !parseMilliseconds(trim(text.substring(0, open)), offset, true))
+        { valid = false; break; }
+        String pipeline = trim(text.substring(open + 1, close));
+        if (!pipeline.length() || pipeline.indexOf('{') >= 0)
+        { valid = false; break; }
+        String args = pipeline;
+        String name = nextToken(args);
+        name.toLowerCase();
+        if (name == "clock")
+        {
+            Job parsed;
+            if (!prepareClockJob(pipeline, parsed)) { valid = false; break; }
+            queued[count].isClock = true;
+            queued[count].durationMs = parsed.durationMs;
+            queued[count].pinMask = clockWindow(parsed).pinMask;
+        }
+        else
+        {
+            // Immediate commands run once when their deadline arrives.
+            const String allowed = " read write adc ohm map not edge rising falling debounce toggle divide pulse print shiftin shiftout status pins help ";
+            if (allowed.indexOf(String(" ") + name + " ") < 0)
+            { valid = false; break; }
+            String parts[10];
+            int partCount = splitPipeline(pipeline, parts, 10);
+            int separators = 0;
+            for (unsigned int i = 0; i < pipeline.length(); ++i)
+                if (pipeline[i] == '|') ++separators;
+            if (partCount > 9 || separators != partCount - 1)
+            { valid = false; break; }
+            for (int i = 1; i < partCount; ++i)
+            {
+                Stage stage;
+                if (!parsePipelineStage(parts[i], stage)) valid = false;
+            }
+            if (!valid) break;
+            queued[count].isClock = false;
+        }
+        queued[count].pipeline = pipeline;
+        if (queued[count].durationMs > 2147483647UL - offset)
+        { valid = false; break; }
+        queued[count++].startMs = offset;
+        text = trim(text.substring(close + 1));
+    }
+    int freeCount = 0;
+    for (int i = 0; i < MAX_SCHEDULED_COMMANDS; ++i) if (!scheduled[i].id) ++freeCount;
+    if (!valid || !count || count > freeCount)
+    {
+        delete[] queued;
+        commandOutput->println(F("ERROR: invalid schedule or queue full (maximum 32 pending entries)"));
+        return;
+    }
+    unsigned long base = millis();
+    for (int i = 0; i < count; ++i) queued[i].startMs += base;
+    if (!validatePlan(queued, count, base))
+    {
+        delete[] queued;
+        return;
+    }
+    int entry = 0;
+    for (int i = 0; i < MAX_SCHEDULED_COMMANDS && entry < count; ++i)
+        if (!scheduled[i].id)
+        {
+            queued[entry].id = nextJobId++;
+            scheduled[i] = queued[entry++];
+            commandOutput->print(F("Scheduled job "));
+            commandOutput->println(scheduled[i].id);
+        }
+    delete[] queued;
+}
+
+static void serviceJobs()
+{
+    unsigned long now = millis();
+    // Finish every expired note before starting any note at the same boundary.
+    for (int i = 0; i < 8; ++i)
+        if (jobs[i].active && jobs[i].durationMs &&
+            (long)(now - (jobs[i].startMs + jobs[i].durationMs)) >= 0)
+            stopJob(jobs[i]);
+    // Start due entries in timestamp order, even if the block was unordered.
+    for (int n = 0; n < MAX_SCHEDULED_COMMANDS; ++n)
+    {
+        int first = -1;
+        for (int i = 0; i < MAX_SCHEDULED_COMMANDS; ++i)
+            if (scheduled[i].id && (long)(now - scheduled[i].startMs) >= 0 &&
+                (first < 0 || (long)(scheduled[i].startMs - scheduled[first].startMs) < 0))
+                first = i;
+        if (first < 0) break;
+        ScheduledCommand &entry = scheduled[first];
+        if (entry.durationMs && (long)(now - (entry.startMs + entry.durationMs)) >= 0)
+        {
+            entry = ScheduledCommand(); // Skip a note whose entire window was missed.
+            continue;
+        }
+        if (!entry.isClock)
+        {
+            String command = entry.pipeline;
+            entry = ScheduledCommand();
+            handleCommand(command);
+            continue;
+        }
+        int slot = -1;
+        for (int i = 0; i < 8; ++i) if (!jobs[i].active) { slot = i; break; }
+        if (slot < 0) break; // Preflight reserves capacity; retry if the loop ran late.
+        Job parsed;
+        if (prepareClockJob(entry.pipeline, parsed))
+        {
+            parsed.id = entry.id;
+            parsed.startMs = entry.startMs;
+            jobs[slot] = parsed;
+        }
+        entry = ScheduledCommand();
+    }
+    for (int i = 0; i < 8; ++i)
+    {
+        Job &job = jobs[i];
+        if (!job.active || (long)(now - job.startMs) < 0) continue;
+        if (!job.isClock)
+        {
+            String command = job.pipeline;
+            stopJob(job);
+            handleCommand(command);
+            continue;
+        }
+        if (!job.started)
+        {
+            job.started = true;
+            for (int s = 0; s < job.stageCount; ++s)
+                if (job.stages[s].kind == STAGE_WRITE)
+                {
+                    pinMode(job.stages[s].p1, OUTPUT);
+                    digitalWrite(job.stages[s].p1, LOW);
+                }
+            job.next = micros() + job.interval;
+        }
+        if ((long)(micros() - job.next) >= 0)
+        {
+            job.clockState = 1 - job.clockState;
+            int value = job.clockState;
+            bool hasValue = true;
+            for (int s = 0; s < job.stageCount; ++s)
+                if (!applySignalStage(job.stages[s], hasValue, value))
+                { stopJob(job); break; }
+            if (job.active) job.next += job.interval;
+        }
+    }
 }
 
 static void handleCommand(const String &line)
@@ -1176,6 +1571,14 @@ static void handleCommand(const String &line)
     String commandLine = trim(line);
     if (commandLine.length() == 0)
     {
+        return;
+    }
+
+    String scheduleArgs = commandLine;
+    String scheduleName = nextToken(scheduleArgs);
+    if (scheduleName.equalsIgnoreCase("schedule"))
+    {
+        startSchedule(scheduleArgs);
         return;
     }
 
@@ -1221,9 +1624,14 @@ static void handleCommand(const String &line)
     {
         for (int i = 0; i < 8; ++i)
         {
-            jobs[i].active = false;
-            jobs[i].stageCount = 0;
-            jobs[i].pipeline = "";
+            stopJob(jobs[i]);
+        }
+        for (int i = 0; i < MAX_SCHEDULED_COMMANDS; ++i)
+            scheduled[i] = ScheduledCommand();
+        if (pendingWritePulse.active)
+        {
+            digitalWrite(pendingWritePulse.pin, LOW);
+            pendingWritePulse.active = false;
         }
         commandOutput->println(F("reset"));
         return;
@@ -1385,15 +1793,25 @@ void loop()
         char ch = Serial.read();
         if (ch == '\n' || ch == '\r')
         {
-            if (inputBuffer.length() > 0)
+            if (inputBuffer.length() > 0 && inputBraceDepth <= 0)
             {
                 handleCommand(inputBuffer);
                 inputBuffer = "";
+                inputBraceDepth = 0;
             }
+            else if (inputBuffer.length() > 0) inputBuffer += ' ';
         }
         else
         {
+            if (ch == '{') ++inputBraceDepth;
+            if (ch == '}') --inputBraceDepth;
             inputBuffer += ch;
+            if (inputBuffer.length() > 4096)
+            {
+                Serial.println(F("ERROR: command too long"));
+                inputBuffer = "";
+                inputBraceDepth = 0;
+            }
         }
     }
 
@@ -1407,30 +1825,6 @@ void loop()
         pendingWritePulse.endTime = 0;
     }
 
-    for (int i = 0; i < 8; ++i)
-    {
-        if (!jobs[i].active)
-        {
-            continue;
-        }
-        if ((long)(micros() - jobs[i].next) >= 0)
-        {
-            jobs[i].clockState = jobs[i].clockState == 0 ? 1 : 0;
-            int value = jobs[i].clockState;
-            bool hasValue = true;
-
-            for (int s = 0; s < jobs[i].stageCount; ++s)
-            {
-                if (!applySignalStage(jobs[i].stages[s], hasValue, value))
-                {
-                    Serial.println(F("ERROR: job stage failure"));
-                    jobs[i].active = false;
-                    break;
-                }
-            }
-
-            jobs[i].next += jobs[i].interval;
-        }
-    }
+    serviceJobs();
     yield();
 }

@@ -64,6 +64,19 @@ test('HTTP errors release the queue and preserve device error text', async () =>
   assert.equal(c.timers.size, 0);
 });
 
+test('multiline schedule reaches the device as one command', async () => {
+  const command = 'schedule {\n 1000 {clock 1000 --dur 500 | write 15}\n 1500 {clock 1400 --dur 1000 | write 15}\n}';
+  let calls = 0;
+  const c = client(async (_, options) => {
+    ++calls;
+    assert.equal(options.body.get('command'), command);
+    assert.equal(new URLSearchParams(options.body.toString()).get('command'), command);
+    return response('Scheduled job 1\nScheduled job 2');
+  });
+  assert.match(await c.send(command), /Scheduled job 2/);
+  assert.equal(calls, 1);
+});
+
 // Run with `node tests/web_request.test.cjs` (Node 16+).
 (async () => {
   for (const {name, run} of tests) {

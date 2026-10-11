@@ -1,5 +1,6 @@
-from commandware.core import HardwareState, JobManager, Pipeline, parse_pipeline, resistance_from_voltage, run_stream
+from commandware.core import HardwareState, JobManager, Pipeline, parse_pipeline, parse_schedule, resistance_from_voltage, run_stream
 import pytest
+from pathlib import Path
 
 
 def test_map_scales_values():
@@ -118,3 +119,92 @@ def test_ohm_interpolation_is_monotonic_and_finite():
 def test_ohm_rejects_invalid_arguments(args):
     with pytest.raises(ValueError, match="only A0"):
         run_stream(f"ohm {args}")
+
+
+def test_schedule_parses_multiline_and_case_insensitive_commands():
+    entries = parse_schedule("""SCHEDULE {
+        1000 { CLOCK 1000 --dur 500 | WRITE 15 }
+        1500 { clock 1400 --dur 1000 | write 15 }
+    }""")
+    assert [entry.start_ms for entry in entries] == [1000, 1500]
+    hw = HardwareState()
+    run_stream("schedule { " + " ".join(f"{e.start_ms} {{ {e.pipeline} }}" for e in entries) + " }", hardware=hw)
+    assert hw.gpio[15] == 0
+    assert hw.pin_owners == {}
+
+
+@pytest.mark.parametrize("option", ["", " 15"])
+def test_finite_clock_stops_low_and_releases_job(option):
+    hw, manager = HardwareState(), JobManager()
+    command = f"clock 1000{option} --dur 2" + ("" if option else " | write 15")
+    assert run_stream(command, hardware=hw, jobs=manager) == [1, 0, 1]
+    assert hw.gpio[15] == 0
+    assert not hw.pin_owners
+    assert not manager.jobs
+
+
+@pytest.mark.parametrize("args", ["--dur", "--dur 0", "--dur -1", "--dur 1.5", "--dur nan", "--dur 2147483648", "--dur 2 --dur 3", "--duration 2"])
+def test_clock_rejects_invalid_duration(args):
+    with pytest.raises(ValueError):
+        run_stream(f"clock 1000 {args} | write 15")
+
+
+@pytest.mark.parametrize("text", [
+    "schedule {}", "schedule { -1 { clock 1 } }", "schedule { 0 {} }",
+    "schedule { 0 { clock 1 }", "schedule { 0 { schedule { 0 { clock 1 } } } }",
+    "schedule { 0 { clock 1 } } trailing", "schedule { 0 { clock 1 | } }",
+    "schedule { 2147483647 { clock 1 --dur 1 } }",
+    "schedule {" + "0 { clock 1 } " * 9 + "}",
+    "schedule {" + "0 { print 1 } " * 33 + "}",
+])
+def test_schedule_rejects_invalid_blocks_without_side_effects(text):
+    hw = HardwareState()
+    with pytest.raises(ValueError):
+        run_stream(text, hardware=hw)
+    assert not hw.gpio
+    assert not hw.pin_owners
+
+
+def test_schedule_rejects_overlapping_clocks_atomically():
+    hw = HardwareState()
+    with pytest.raises(ValueError, match="overlapping"):
+        run_stream("schedule { 0 { clock 1000 --dur 5 | write 15 } 4 { clock 1000 --dur 5 | write 15 } }", hardware=hw)
+    assert not hw.gpio
+
+
+def test_schedule_runs_parallel_pipelines_and_stops_before_shared_boundary():
+    class RecordingHardware(HardwareState):
+        def set_gpio(self, pin, value):
+            writes.append((pin, value))
+            return super().set_gpio(pin, value)
+
+    writes = []
+    hw = RecordingHardware()
+    run_stream("schedule { 2 { clock 1000 --dur 1 | write 15 } 0 { clock 1000 --dur 2 | write 15 } 0 { clock 1000 --dur 1 | write 5 } }", hardware=hw)
+    assert writes == [(15, 0), (5, 0), (15, 1), (5, 1), (5, 0), (15, 0), (15, 1), (15, 0), (15, 0), (15, 1), (15, 0)]
+    assert not hw.pin_owners
+
+
+def test_schedule_keeps_transform_state_between_clock_ticks():
+    assert run_stream("schedule { 0 { clock 1000 --dur 3 | divide 2 | toggle | print } }") == [1, 0]
+
+
+def test_schedule_executes_immediate_commands_in_time_order():
+    hw = HardwareState()
+    assert run_stream("schedule { 20 { write 15 0 } 10 { write 15 1 } }", hardware=hw) == [1, 0]
+    assert hw.gpio[15] == 0
+
+
+def test_entire_happy_birthday_runs_in_one_schedule():
+    command = (Path(__file__).resolve().parents[1] / "examples/happy-birthday.cw").read_text()
+    assert len(parse_schedule(command)) == 25
+    hw, manager = HardwareState(), JobManager()
+    output = run_stream(command, hardware=hw, jobs=manager)
+    assert len(output) > 1000
+    assert hw.gpio[15] == 0
+    assert not hw.pin_owners and not manager.jobs
+
+
+def test_32_sequential_clocks_fit_without_reserving_32_execution_slots():
+    command = "schedule {" + " ".join(f"{i} {{ clock 1000 --dur 1 | write 15 }}" for i in range(32)) + "}"
+    assert run_stream(command) == [1] * 32
