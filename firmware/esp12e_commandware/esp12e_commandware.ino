@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <math.h>
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
 
@@ -96,12 +97,13 @@ static const char WEB_PAGE[] PROGMEM = R"rawliteral(
     </section>
   </main>
   <script>
-    const f=document.getElementById('command-form'),i=document.getElementById('command'),r=document.getElementById('result'),d=document.getElementById('command-suggestions'),a=document.getElementById('command-action'),j=document.getElementById('jobs-list'),p=['help','write 4 1','write 4 0','write 4 1 100','read 4','read 5','read 12','adc A0','clock 500 | write 5'];let h=[],busy=false;
+    const f=document.getElementById('command-form'),i=document.getElementById('command'),r=document.getElementById('result'),d=document.getElementById('command-suggestions'),a=document.getElementById('command-action'),j=document.getElementById('jobs-list'),p=['help','write 4 1','write 4 0','write 4 1 100','read 4','read 5','read 12','adc A0','ohm A0','status','clock 500 | write 5'];let h=[],busy=false;
     function suggestions(){const all=[...h,...p.filter(c=>!h.includes(c))],query=i.value.trim().toLowerCase(),matches=query?all.filter(c=>c.toLowerCase().includes(query)):all;d.replaceChildren(...matches.map(c=>{const b=document.createElement('button');b.type='button';b.textContent=c;b.setAttribute('role','option');b.onclick=()=>{i.value=c;closeSuggestions();i.focus()};return b}));if(!matches.length){const empty=document.createElement('div');empty.textContent='No matching commands';empty.style.cssText='padding:.5rem;color:#93a4bc;font-size:.85rem';d.append(empty)}}
     function openSuggestions(){suggestions();d.hidden=false;a.textContent=i.value?'×':'▾';a.setAttribute('aria-label',i.value?'Clear command':'Show command suggestions');a.setAttribute('aria-expanded','true');i.setAttribute('aria-expanded','true')}
     function closeSuggestions(){d.hidden=true;a.textContent=i.value?'×':'▾';a.setAttribute('aria-label',i.value?'Clear command':'Show command suggestions');a.setAttribute('aria-expanded','false');i.setAttribute('aria-expanded','false')}
     function remember(c){h=[c,...h.filter(x=>x!==c)].slice(0,12);if(!d.hidden)suggestions()}
-    async function send(c){const x=await fetch('/api/command',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({command:c})}),t=await x.text();if(!x.ok)throw Error(t||x.statusText);return t}
+    let requestQueue=Promise.resolve();
+    function send(c){const request=requestQueue.then(async()=>{const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),10000);try{const x=await fetch('/api/command',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({command:c}),signal:controller.signal}),t=await x.text();if(!x.ok)throw Error(t||x.statusText);return t}catch(e){if(e.name==='AbortError')throw Error('Request timed out. Check device connection; command may have executed.');throw e}finally{clearTimeout(timer)}});requestQueue=request.catch(()=>{});return request}
     async function refresh(){if(busy)return;busy=true;try{const t=await send('jobs'),a=t.split(/\r?\n/).map(s=>s.match(/^(\d+)\s+RUNNING\s+(.*)$/)).filter(Boolean);j.replaceChildren();if(!a.length){j.textContent='No jobs running.';return}a.forEach(m=>{const li=document.createElement('li'),b=document.createElement('button');li.append(document.createTextNode(`#${m[1]} ${m[2]} `));b.textContent='Kill';b.onclick=async()=>{b.disabled=true;try{r.textContent=await send(`kill ${m[1]}`);await refresh()}catch(e){r.textContent=`Request failed: ${e}`;b.disabled=false}};li.append(b);j.append(li)})}catch(e){j.textContent=`Unable to load jobs: ${e}`}finally{busy=false}}
     a.onclick=()=>{if(i.value)i.value='';openSuggestions();i.focus()};i.onfocus=()=>openSuggestions();i.oninput=()=>openSuggestions();document.addEventListener('click',e=>{if(!e.target.closest('.command-entry'))closeSuggestions()});document.addEventListener('keydown',e=>{if(e.key==='Escape')closeSuggestions()});f.onsubmit=async e=>{e.preventDefault();const c=i.value.trim();r.textContent='Running...';closeSuggestions();try{r.textContent=await send(c);remember(c);await refresh()}catch(x){r.textContent=`Request failed: ${x}`}};closeSuggestions();refresh();setInterval(refresh,3000);
   </script>
@@ -167,6 +169,7 @@ enum StageKind
 {
     STAGE_NONE,
     STAGE_MAP,
+    STAGE_OHM,
     STAGE_NOT,
     STAGE_EDGE,
     STAGE_RISING,
@@ -303,6 +306,8 @@ static void printHelp()
     commandOutput->println(F("read PIN"));
     commandOutput->println(F("write PIN VALUE [DURATION_MS]"));
     commandOutput->println(F("adc A0"));
+    commandOutput->println(F("ohm [A0] (ohms, <270, >700k, OUT_OF_RANGE)"));
+    commandOutput->println(F("adc A0 | ohm (terminal measurement stage)"));
     commandOutput->println(F("clock HZ [PIN]"));
     commandOutput->println(F("map IN_MIN IN_MAX OUT_MIN OUT_MAX VALUE"));
     commandOutput->println(F("not VALUE"));
@@ -380,6 +385,52 @@ static int splitPipeline(const String &line, String parts[], int maxParts)
     return count;
 }
 
+// Measured counts -> millivolts -> piecewise exponential resistance.
+// Calibration: 20160-ohm reference, 3357-ohm parallel shunt.
+static void printOhmReading(int raw)
+{
+    if (raw < 0 || raw > 1023)
+    {
+        commandOutput->println(F("OUT_OF_RANGE"));
+        return;
+    }
+    // Counts 30-49 extrapolate the first measured segment (which starts at 50).
+    if (raw < 30)
+    {
+        commandOutput->println(F("<270"));
+        return;
+    }
+    if (raw > 720)
+    {
+        commandOutput->println(F(">700k"));
+        return;
+    }
+    static const int counts[] = {50, 179, 291, 459, 557, 628, 703, 720};
+    static const float millivolts[] = {60, 181, 288, 449, 543, 612, 682, 697};
+    static const long resistances[] = {270, 995, 1992, 5152, 9959, 20020, 108800, 688900};
+    for (int i = 0; i < 8; ++i)
+    {
+        if (raw == counts[i])
+        {
+            commandOutput->println(resistances[i]);
+            return;
+        }
+    }
+    for (int i = 1; i < 8; ++i)
+    {
+        if (raw <= counts[i])
+        {
+            float voltage = (millivolts[i - 1] + (raw - counts[i - 1]) *
+                (millivolts[i] - millivolts[i - 1]) / (counts[i] - counts[i - 1]));
+            float fraction = (voltage - millivolts[i - 1]) / (millivolts[i] - millivolts[i - 1]);
+            float resistance = resistances[i - 1] * expf(fraction *
+                logf((float)resistances[i] / resistances[i - 1]));
+            commandOutput->println((long)(resistance + 0.5f));
+            return;
+        }
+    }
+}
+
 static bool applySignalStage(Stage &stage, bool &hasValue, int &value)
 {
     if (!hasValue)
@@ -389,6 +440,10 @@ static bool applySignalStage(Stage &stage, bool &hasValue, int &value)
 
     switch (stage.kind)
     {
+    case STAGE_OHM:
+        printOhmReading(value);
+        hasValue = false;
+        return true;
     case STAGE_MAP:
         value = mapValue(value, stage.p1, stage.p2, stage.p3, stage.p4);
         return true;
@@ -515,6 +570,13 @@ static bool parsePipelineStage(const String &stageText, Stage &stage)
     String name = nextToken(args);
     name.toLowerCase();
 
+    if (name == "ohm")
+    {
+        if (args.length() != 0)
+            return false;
+        stage.kind = STAGE_OHM;
+        return true;
+    }
     if (name == "map")
     {
         stage.kind = STAGE_MAP;
@@ -1181,6 +1243,17 @@ static void handleCommand(const String &line)
         handleADCCommand(commandLine);
         return;
     }
+    if (command == "ohm")
+    {
+        String pin = nextToken(commandLine);
+        if ((pin.length() && !pin.equalsIgnoreCase("A0")) || nextToken(commandLine).length())
+        {
+            commandOutput->println(F("ERROR: ohm accepts only A0"));
+            return;
+        }
+        printOhmReading(analogRead(A0));
+        return;
+    }
     if (command == "clock")
     {
         startClockJob(line);
@@ -1249,6 +1322,14 @@ static void handleCommand(const String &line)
     if (command == "status")
     {
         commandOutput->println(F("ESP8266 Commandware ready"));
+        commandOutput->print(F("Uptime ms: "));
+        commandOutput->println(millis());
+        commandOutput->print(F("Free heap: "));
+        commandOutput->println(ESP.getFreeHeap());
+        commandOutput->print(F("Wi-Fi status: "));
+        commandOutput->println((int)WiFi.status());
+        commandOutput->print(F("IP: "));
+        commandOutput->println(WiFi.localIP());
         return;
     }
 
@@ -1262,6 +1343,7 @@ void setup()
     Serial.begin(115200);
     delay(1000);
     Serial.println(F("Commandware ESP-12E ready"));
+    Serial.println(ESP.getResetReason());
     Serial.println(F("Type 'help' for commands"));
 
     configureWebServer();
@@ -1350,4 +1432,5 @@ void loop()
             jobs[i].next += jobs[i].interval;
         }
     }
+    yield();
 }

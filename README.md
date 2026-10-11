@@ -84,6 +84,7 @@ lowercase forms.
 
 - read
 - adc
+- ohm
 - clock
 - shiftin
 - map
@@ -107,3 +108,53 @@ input range, not a guarantee that the software-driven GPIO output can reach
 every requested frequency: loop and `digitalWrite` overhead limit the actual
 output rate, especially at the high end. The ESP8266 itself does not impose the
 old 500 Hz limit; that came from the firmware's former millisecond scheduler.
+
+## Calibrated resistance measurement
+
+Run `ohm` or `ohm A0` over serial or the web console. `adc A0 | ohm` also
+works, with `ohm` as the terminal measurement stage. Numeric output is rounded
+to whole ohms. In the Python simulator, `ohm` converts incoming raw ADC values
+or reads the virtual A0 when no values are supplied.
+
+This calibration is specific to the measured circuit: 4.954 V through 20,160 Ω
+to A0, with 3,357 Ω and the unknown resistor in parallel from A0 to ground.
+ADC counts are interpolated linearly to measured node voltage. Between adjacent
+measured voltage/resistance pairs, resistance follows a piecewise exponential
+function, with voltage in millivolts and resistance in ohms:
+
+```text
+R(v) = Ri * exp(((v - vi) / (vi+1 - vi)) * log(Ri+1 / Ri))
+```
+
+| Known resistor (Ω) | Raw A0 | Node voltage (mV) |
+| --- | --- | --- |
+| 270 | 50 | 60 |
+| 995 | 179 | 181 |
+| 1992 | 291 | 288 |
+| 5152 | 459 | 449 |
+| 9959 | 557 | 543 |
+| 20020 | 628 | 612 |
+| 108800 | 703 | 682 |
+| 688900 | 720 | 697 |
+
+The function passes through all eight measurements and follows the connecting
+lines on the logarithmic resistance chart. Numeric output is accepted for A0
+counts 30–720, including both endpoints (approximately 41.2403–697 mV).
+Counts 30–49 extrapolate the first measured segment, giving approximately
+221–267 Ω; this extension is uncalibrated. Counts below 30 report `<270`;
+counts above 720 report `>700k`. The upper label is approximate: the last
+measured resistance is 688,900 Ω, and no extrapolation to 700,000 Ω is performed.
+Counts outside the valid ADC range 0–1023 report `OUT_OF_RANGE`.
+
+Python also provides `resistance_from_voltage(v_mv)` for measured millivolts,
+with the same bounds and whole-ohm output. Interpolation does not establish
+accuracy between measurements, particularly near the high-resistance plateau.
+Changing the supply, divider, or A0 input circuitry requires new calibration.
+
+Web requests are serialized and time out after ten seconds. A timed-out command
+may already have executed; it is not automatically retried. A failed command
+does not prevent later requests. This improves recovery but does not establish
+the cause of a device lockup. If it recurs, try `status` over serial at 115200
+baud: firmware status includes uptime, free heap, Wi-Fi status and IP address;
+startup also prints the reset reason. Compare web and serial responsiveness
+before restarting the board.

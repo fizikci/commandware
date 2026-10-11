@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shlex
+from math import exp, isfinite, log
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
@@ -191,6 +192,62 @@ def _adc(args: list[str], hardware: HardwareState, values: Sequence[object] | No
     return [hardware.read_analog(pin)]
 
 
+# Measured (A0 counts, node millivolts, resistance in ohms), for the
+# 20160-ohm reference / 3357-ohm shunt circuit.
+OHM_CALIBRATION = (
+    (50, 60, 270), (179, 181, 995), (291, 288, 1992),
+    (459, 449, 5152), (557, 543, 9959), (628, 612, 20020),
+    (703, 682, 108800), (720, 697, 688900),
+)
+OHM_MIN_RAW = 30
+# Extend the first measured segment down to the requested ADC limit.
+OHM_MIN_VOLTAGE_MV = OHM_CALIBRATION[0][1] + (
+    (OHM_MIN_RAW - OHM_CALIBRATION[0][0])
+    * (OHM_CALIBRATION[1][1] - OHM_CALIBRATION[0][1])
+    / (OHM_CALIBRATION[1][0] - OHM_CALIBRATION[0][0])
+)
+
+
+def resistance_from_voltage(v_mv: float) -> int | str:
+    """Measured piecewise exponential R(v); numeric results are whole ohms."""
+    if not isfinite(v_mv) or v_mv < 0:
+        return "OUT_OF_RANGE"
+    if v_mv < OHM_MIN_VOLTAGE_MV:
+        return "<270"
+    if v_mv > OHM_CALIBRATION[-1][1]:
+        return ">700k"
+    for (_, low_mv, low_r), (_, high_mv, high_r) in zip(OHM_CALIBRATION, OHM_CALIBRATION[1:]):
+        if v_mv <= high_mv:
+            if v_mv == low_mv:
+                return low_r
+            if v_mv == high_mv:
+                return high_r
+            fraction = (v_mv - low_mv) / (high_mv - low_mv)
+            return int(low_r * exp(fraction * log(high_r / low_r)) + 0.5)
+    raise AssertionError("Voltage not covered by calibration")
+
+
+def _ohm_reading(raw: int) -> int | str:
+    if not 0 <= raw <= 1023:
+        return "OUT_OF_RANGE"
+    if raw < OHM_MIN_RAW:
+        return "<270"
+    if raw > OHM_CALIBRATION[-1][0]:
+        return ">700k"
+    for (low, low_mv, _), (high, high_mv, _) in zip(OHM_CALIBRATION, OHM_CALIBRATION[1:]):
+        if raw <= high:
+            voltage_mv = low_mv + (raw - low) * (high_mv - low_mv) / (high - low)
+            return resistance_from_voltage(voltage_mv)
+    raise AssertionError("ADC reading not covered by calibration")
+
+
+def _ohm(args: list[str], hardware: HardwareState, values: Sequence[object]) -> list[object]:
+    if args and (len(args) != 1 or args[0].upper() != "A0"):
+        raise ValueError("ohm accepts only A0")
+    readings = values if values else [hardware.read_analog("A0")]
+    return [_ohm_reading(_as_int(value)) for value in readings]
+
+
 def _clock(args: list[str], values: Sequence[object] | None = None, count: int | None = None) -> list[int]:
     total = count if count is not None else (len(values) if values is not None else 1)
     if total is None or total <= 0:
@@ -345,7 +402,7 @@ def _shiftout(args: list[str], hardware: HardwareState, values: Sequence[object]
 def _system_help(_args: list[str], _values: Sequence[object] | None = None, **_: object) -> list[str]:
     return [
         "help", "pins", "jobs", "kill", "status", "reset", "run",
-        "read", "write", "adc", "clock", "map", "not", "edge",
+        "read", "write", "adc", "ohm", "clock", "map", "not", "edge",
         "rising", "falling", "debounce", "toggle", "divide", "pulse",
         "print", "shiftin", "shiftout"
     ]
@@ -401,6 +458,7 @@ def _system_run(args: list[str], _values: Sequence[object] | None = None, hardwa
 COMMANDS: dict[str, Callable[..., list[object]]] = {
     "read": lambda args, values, hardware, jobs=None, job_id=None, count=None: _read_pin(args, hardware, values),
     "adc": lambda args, values, hardware, jobs=None, job_id=None, count=None: _adc(args, hardware, values),
+    "ohm": lambda args, values, hardware, jobs=None, job_id=None, count=None: _ohm(args, hardware, values),
     "clock": lambda args, values, hardware, jobs=None, job_id=None, count=None: _clock(args, values, count),
     "map": lambda args, values, hardware, jobs=None, job_id=None, count=None: _map(args, values),
     "not": lambda args, values, hardware, jobs=None, job_id=None, count=None: _not(values),
@@ -429,7 +487,7 @@ def _dispatch(command: Command, values: Sequence[object], hardware: HardwareStat
     handler = COMMANDS.get(command.name)
     if handler is None:
         raise ValueError(f"Unsupported command: {command.name}")
-    return handler(command.args, values, hardware, jobs=jobs, job_id=job_id, count=count)
+    return handler(command.args, values, hardware=hardware, jobs=jobs, job_id=job_id, count=count)
 
 
 def run_stream(command: str, values: Sequence[object] | None = None, hardware: HardwareState | None = None, jobs: JobManager | None = None, count: int | None = None, job_id: int | None = None) -> list[object]:
@@ -445,4 +503,4 @@ def run_stream(command: str, values: Sequence[object] | None = None, hardware: H
     handler = COMMANDS.get(name)
     if handler is None:
         raise ValueError(f"Unsupported command: {name}")
-    return handler(args, stream, hardware, jobs=jobs, job_id=job_id, count=count)
+    return handler(args, stream, hardware=hardware, jobs=jobs, job_id=job_id, count=count)
