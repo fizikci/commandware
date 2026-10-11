@@ -3,6 +3,7 @@
 #include <new>
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
+#include <Wire.h>
 
 // Credentials stay in a local, Git-ignored header. Fresh checkouts still
 // compile and provide the serial console with Wi-Fi disabled.
@@ -192,6 +193,7 @@ enum StageKind
     STAGE_PULSE,
     STAGE_WRITE,
     STAGE_PRINT,
+    STAGE_LCD_PRINT,
 };
 
 struct Stage
@@ -215,6 +217,9 @@ struct Job
     bool active = false;
     bool started = false;
     bool isClock = true;
+    bool adcWatch = false;
+    bool hasADC = false;
+    int lastADC = 0;
     unsigned long startMs = 0;
     unsigned long durationMs = 0; // Zero means unlimited.
     unsigned long interval = 0;
@@ -248,6 +253,8 @@ struct ClockWindow
 };
 static String inputBuffer;
 static int inputBraceDepth = 0;
+static bool inputQuoted = false;
+static bool inputEscaped = false;
 
 struct PendingWritePulse
 {
@@ -336,6 +343,163 @@ static int mapValue(int value, int inMin, int inMax, int outMin, int outMax)
     return (int)(outMin + (scaled / denom));
 }
 
+// Common PCF8574 backpack: P0=RS, P1=RW, P2=E, P3=backlight,
+// P4..P7=D4..D7. Wire ships with the ESP8266 core.
+static bool lcdReady = false;
+static uint8_t lcdAddress = 0x27;
+static const unsigned long LCD_PIN_MASK = (1UL << 4) | (1UL << 5);
+
+static bool lcdNibble(uint8_t value)
+{
+    Wire.beginTransmission(lcdAddress);
+    Wire.write((uint8_t)(value | 0x08));
+    Wire.write((uint8_t)(value | 0x0c));
+    Wire.write((uint8_t)(value | 0x08));
+    return Wire.endTransmission() == 0;
+}
+
+static bool lcdByte(uint8_t value, bool data = false)
+{
+    bool ok = lcdNibble((value & 0xf0) | (data ? 1 : 0)) &&
+              lcdNibble((value << 4) | (data ? 1 : 0));
+    delayMicroseconds(50);
+    return ok;
+}
+
+static bool lcdFailure()
+{
+    lcdReady = false;
+    commandOutput->println(F("ERROR: LCD I2C communication failed; check wiring and address"));
+    return false;
+}
+
+static bool initLCD(uint8_t address)
+{
+    // Do not take the bus pins away from running or queued GPIO writers.
+    for (int i = 0; i < 8; ++i)
+        if (jobs[i].active)
+            for (int s = 0; s < jobs[i].stageCount; ++s)
+                if (jobs[i].stages[s].kind == STAGE_WRITE &&
+                    (jobs[i].stages[s].p1 == 4 || jobs[i].stages[s].p1 == 5))
+                {
+                    commandOutput->println(F("ERROR: LCD GPIO4/GPIO5 are used by a job"));
+                    return false;
+                }
+    for (int i = 0; i < MAX_SCHEDULED_COMMANDS; ++i)
+        if (scheduled[i].id && (scheduled[i].pinMask & LCD_PIN_MASK))
+        {
+            commandOutput->println(F("ERROR: LCD GPIO4/GPIO5 are used by a queued job"));
+            return false;
+        }
+    if (pendingWritePulse.active && (pendingWritePulse.pin == 4 || pendingWritePulse.pin == 5))
+    {
+        commandOutput->println(F("ERROR: LCD GPIO4/GPIO5 are used by a pulse"));
+        return false;
+    }
+    lcdReady = false;
+    lcdAddress = address;
+    Wire.begin(4, 5); // SDA, SCL: GPIO numbers, not board D labels.
+    Wire.setClock(100000);
+    Wire.beginTransmission(lcdAddress);
+    if (Wire.endTransmission() != 0) return lcdFailure();
+    // HD44780 power-on / 4-bit initialization (datasheet figure 24).
+    delay(50);
+    if (!lcdNibble(0x30)) return lcdFailure();
+    delayMicroseconds(4500);
+    if (!lcdNibble(0x30)) return lcdFailure();
+    delayMicroseconds(150);
+    if (!lcdNibble(0x30) || !lcdNibble(0x20) || !lcdByte(0x28) ||
+        !lcdByte(0x08) || !lcdByte(0x01)) return lcdFailure();
+    delay(2);
+    if (!lcdByte(0x06) || !lcdByte(0x0c)) return lcdFailure();
+    lcdReady = true;
+    return true;
+}
+
+static bool printLCD(const String &text)
+{
+    if (!lcdReady && !initLCD(lcdAddress)) return false;
+    char cells[32];
+    for (int i = 0; i < 32; ++i) cells[i] = ' ';
+    int pos = 0;
+    for (unsigned int i = 0; i < text.length() && pos < 32; ++i)
+        if (text[i] == '\n') pos = pos < 16 ? 16 : 32;
+        else cells[pos++] = text[i];
+    // Overwrite with spaces instead of clearing to avoid flicker and stale digits.
+    for (int row = 0; row < 2; ++row)
+    {
+        if (!lcdByte(row ? 0xc0 : 0x80)) return lcdFailure();
+        for (int col = 0; col < 16; ++col)
+            if (!lcdByte(cells[row * 16 + col], true)) return lcdFailure();
+    }
+    return true;
+}
+
+static bool lcdLiteral(String args, String &text)
+{
+    args = trim(args);
+    if (!args.startsWith("\"")) return false;
+    for (unsigned int i = 1; i < args.length(); ++i)
+    {
+        char ch = args[i];
+        if (ch == '"') return trim(args.substring(i + 1)).length() == 0;
+        if (ch == '\\')
+        {
+            if (++i == args.length()) return false;
+            ch = args[i];
+            if (ch == 'n') ch = '\n';
+            else if (ch != '\\' && ch != '"') return false;
+        }
+        text += ch;
+    }
+    return false;
+}
+
+static void handleLCDCommand(String args)
+{
+    String action = nextToken(args);
+    action.toLowerCase();
+    if (action == "print")
+    {
+        String text;
+        if (!lcdLiteral(args, text))
+            commandOutput->println(F("ERROR: lcd print requires a double-quoted string or piped input"));
+        else if (printLCD(text)) commandOutput->println(F("OK"));
+        return;
+    }
+    if (action == "clear" && !trim(args).length())
+    {
+        if (printLCD("")) commandOutput->println(F("OK"));
+        return;
+    }
+    if (action == "init")
+    {
+        String token = nextToken(args);
+        char *end;
+        long address = token.length() ? strtol(token.c_str(), &end, 0) : 0x27;
+        if ((token.length() && *end) || address < 0x08 || address > 0x77 || trim(args).length())
+            commandOutput->println(F("ERROR: lcd init accepts an I2C address (0x08..0x77)"));
+        else if (initLCD((uint8_t)address)) commandOutput->println(F("OK"));
+        return;
+    }
+    commandOutput->println(F("ERROR: use lcd init [ADDRESS], lcd print \"TEXT\", or lcd clear"));
+}
+
+// Delimiters inside LCD strings are literal characters, including escaped quotes.
+static int unquotedIndex(const String &text, char target, int start = 0)
+{
+    bool quoted = false, escaped = false;
+    for (unsigned int i = start; i < text.length(); ++i)
+    {
+        char ch = text[i];
+        if (quoted && escaped) { escaped = false; continue; }
+        if (quoted && ch == '\\') { escaped = true; continue; }
+        if (ch == '"') { quoted = !quoted; continue; }
+        if (!quoted && ch == target) return i;
+    }
+    return -1;
+}
+
 static void printHelp()
 {
     commandOutput->println(F("Commandware ESP-12E shell"));
@@ -347,7 +511,9 @@ static void printHelp()
     commandOutput->println(F("reset"));
     commandOutput->println(F("read PIN"));
     commandOutput->println(F("write PIN VALUE [DURATION_MS]"));
-    commandOutput->println(F("adc A0"));
+    commandOutput->println(F("adc A0 [--watch] (watch samples changes every 100 ms)"));
+    commandOutput->println(F("lcd init [ADDRESS] (16x2 I2C, default 0x27; SDA=4 SCL=5)"));
+    commandOutput->println(F("lcd print \"TEXT\"; lcd clear; SOURCE | lcd print"));
     commandOutput->println(F("ohm [A0] (ohms, <270, >700k, OUT_OF_RANGE)"));
     commandOutput->println(F("adc A0 | ohm (terminal measurement stage)"));
     commandOutput->println(F("clock HZ [PIN] [--dur MILLISECONDS]"));
@@ -379,6 +545,10 @@ static void printPins()
         if (pins[i] == 1 || pins[i] == 3)
         {
             commandOutput->println(F("terminal"));
+        }
+        else if (lcdReady && (pins[i] == 4 || pins[i] == 5))
+        {
+            commandOutput->println(F("LCD I2C"));
         }
         else
         {
@@ -414,7 +584,7 @@ static int splitPipeline(const String &line, String parts[], int maxParts)
     int start = 0;
     while (start <= line.length() && count < maxParts)
     {
-        int idx = line.indexOf('|', start);
+        int idx = unquotedIndex(line, '|', start);
         String piece;
         if (idx < 0)
         {
@@ -609,6 +779,8 @@ static bool applySignalStage(Stage &stage, bool &hasValue, int &value)
     case STAGE_PRINT:
         commandOutput->println(value);
         return true;
+    case STAGE_LCD_PRINT:
+        return printLCD(String(value));
     default:
         return false;
     }
@@ -620,6 +792,12 @@ static bool parsePipelineStage(const String &stageText, Stage &stage)
     String name = nextToken(args);
     name.toLowerCase();
 
+    if (name == "lcd")
+    {
+        if (!nextToken(args).equalsIgnoreCase("print") || trim(args).length()) return false;
+        stage.kind = STAGE_LCD_PRINT;
+        return true;
+    }
     if (name == "ohm")
     {
         if (args.length() != 0)
@@ -682,7 +860,7 @@ static bool parsePipelineStage(const String &stageText, Stage &stage)
     if (name == "write")
     {
         int pin = toIntDef(nextToken(args), -1);
-        if (pin < 0)
+        if (pin < 0 || (lcdReady && (pin == 4 || pin == 5)))
         {
             return false;
         }
@@ -766,7 +944,7 @@ static void handleWriteCommand(String args)
 static void handleADCCommand(String args)
 {
     String token = nextToken(args);
-    if (token.length() == 0 || !token.equalsIgnoreCase("A0"))
+    if (token.length() == 0 || !token.equalsIgnoreCase("A0") || trim(args).length())
     {
         commandOutput->println(F("ERROR: adc requires A0"));
         return;
@@ -1014,6 +1192,11 @@ static bool evaluateImmediateSource(const String &sourceText, bool &hasValue, in
     if (name == "read")
     {
         int pin = toIntDef(nextToken(args), -1);
+        if (lcdReady && (pin == 4 || pin == 5))
+        {
+            commandOutput->println(F("ERROR: GPIO4/GPIO5 are reserved for LCD I2C"));
+            return false;
+        }
         if (pin < 0)
         {
             commandOutput->println(F("ERROR: read requires PIN"));
@@ -1027,7 +1210,7 @@ static bool evaluateImmediateSource(const String &sourceText, bool &hasValue, in
     if (name == "adc")
     {
         String pin = nextToken(args);
-        if (!pin.equalsIgnoreCase("A0"))
+        if (!pin.equalsIgnoreCase("A0") || trim(args).length())
         {
             commandOutput->println(F("ERROR: adc requires A0"));
             return false;
@@ -1064,6 +1247,11 @@ static bool evaluateImmediateSource(const String &sourceText, bool &hasValue, in
     if (name == "write")
     {
         int pin = toIntDef(nextToken(args), -1);
+        if (lcdReady && (pin == 4 || pin == 5))
+        {
+            commandOutput->println(F("ERROR: GPIO4/GPIO5 are reserved for LCD I2C"));
+            return false;
+        }
         if (pin < 0)
         {
             commandOutput->println(F("ERROR: write requires PIN VALUE"));
@@ -1116,7 +1304,7 @@ static void runImmediatePipeline(const String &line)
             commandOutput->println(F("'"));
             return;
         }
-        if (stage.kind == STAGE_WRITE || stage.kind == STAGE_PRINT)
+        if (stage.kind == STAGE_WRITE || stage.kind == STAGE_PRINT || stage.kind == STAGE_LCD_PRINT)
         {
             hasSink = true;
         }
@@ -1174,6 +1362,8 @@ static ClockWindow clockWindow(const Job &job)
     for (int i = 0; i < job.stageCount; ++i)
         if (job.stages[i].kind == STAGE_WRITE)
             result.pinMask |= 1UL << job.stages[i].p1;
+        else if (job.stages[i].kind == STAGE_LCD_PRINT)
+            result.pinMask |= LCD_PIN_MASK | (1UL << 18);
     return result;
 }
 
@@ -1328,7 +1518,7 @@ static bool prepareClockJob(const String &line, Job &job)
             commandOutput->println(F("ERROR: invalid clock output pin"));
             return false;
         }
-        if (stage.kind == STAGE_WRITE || stage.kind == STAGE_PRINT)
+        if (stage.kind == STAGE_WRITE || stage.kind == STAGE_PRINT || stage.kind == STAGE_LCD_PRINT)
         {
             hasSink = true;
         }
@@ -1337,6 +1527,11 @@ static bool prepareClockJob(const String &line, Job &job)
 
     if (!hasSink && fallbackPin >= 0)
     {
+        if (lcdReady && (fallbackPin == 4 || fallbackPin == 5))
+        {
+            commandOutput->println(F("ERROR: GPIO4/GPIO5 are reserved for LCD I2C"));
+            return false;
+        }
         Stage writeStage;
         writeStage.kind = STAGE_WRITE;
         writeStage.p1 = fallbackPin;
@@ -1371,10 +1566,31 @@ static bool prepareClockJob(const String &line, Job &job)
     return true;
 }
 
+static bool prepareBackgroundJob(const String &line, Job &job)
+{
+    String parts[10];
+    int count = splitPipeline(line, parts, 10);
+    String args = count ? parts[0] : String("");
+    String name = nextToken(args);
+    if (name.equalsIgnoreCase("clock")) return prepareClockJob(line, job);
+    if (!name.equalsIgnoreCase("adc") || !nextToken(args).equalsIgnoreCase("A0") ||
+        nextToken(args) != "--watch" || trim(args).length())
+    {
+        commandOutput->println(F("ERROR: expected adc A0 --watch"));
+        return false;
+    }
+    // Reuse pipeline compilation, resource checks, and the eight job slots.
+    String compiled = String("clock 5") + line.substring(parts[0].length());
+    if (!prepareClockJob(compiled, job)) return false;
+    job.pipeline = line;
+    job.adcWatch = true;
+    return true;
+}
+
 static void startClockJob(const String &line)
 {
     Job job;
-    if (!prepareClockJob(line, job)) return;
+    if (!prepareBackgroundJob(line, job)) return;
     job.startMs = millis();
     ScheduledCommand proposed;
     proposed.pipeline = job.pipeline;
@@ -1416,21 +1632,21 @@ static void startSchedule(String text)
     bool valid = true;
     while (text.length() && valid)
     {
-        int open = text.indexOf('{'), close = text.indexOf('}');
+        int open = unquotedIndex(text, '{'), close = unquotedIndex(text, '}');
         unsigned long offset;
         if (count == MAX_SCHEDULED_COMMANDS || open < 0 || close < open ||
             !parseMilliseconds(trim(text.substring(0, open)), offset, true))
         { valid = false; break; }
         String pipeline = trim(text.substring(open + 1, close));
-        if (!pipeline.length() || pipeline.indexOf('{') >= 0)
+        if (!pipeline.length() || unquotedIndex(pipeline, '{') >= 0)
         { valid = false; break; }
         String args = pipeline;
         String name = nextToken(args);
         name.toLowerCase();
-        if (name == "clock")
+        if (name == "clock" || (name == "adc" && args.indexOf("--watch") >= 0))
         {
             Job parsed;
-            if (!prepareClockJob(pipeline, parsed)) { valid = false; break; }
+            if (!prepareBackgroundJob(pipeline, parsed)) { valid = false; break; }
             queued[count].isClock = true;
             queued[count].durationMs = parsed.durationMs;
             queued[count].pinMask = clockWindow(parsed).pinMask;
@@ -1438,14 +1654,14 @@ static void startSchedule(String text)
         else
         {
             // Immediate commands run once when their deadline arrives.
-            const String allowed = " read write adc ohm map not edge rising falling debounce toggle divide pulse print shiftin shiftout status pins help ";
+            const String allowed = " read write adc ohm lcd map not edge rising falling debounce toggle divide pulse print shiftin shiftout status pins help ";
             if (allowed.indexOf(String(" ") + name + " ") < 0)
             { valid = false; break; }
             String parts[10];
             int partCount = splitPipeline(pipeline, parts, 10);
             int separators = 0;
-            for (unsigned int i = 0; i < pipeline.length(); ++i)
-                if (pipeline[i] == '|') ++separators;
+            for (int i = unquotedIndex(pipeline, '|'); i >= 0; i = unquotedIndex(pipeline, '|', i + 1))
+                ++separators;
             if (partCount > 9 || separators != partCount - 1)
             { valid = false; break; }
             for (int i = 1; i < partCount; ++i)
@@ -1523,7 +1739,7 @@ static void serviceJobs()
         for (int i = 0; i < 8; ++i) if (!jobs[i].active) { slot = i; break; }
         if (slot < 0) break; // Preflight reserves capacity; retry if the loop ran late.
         Job parsed;
-        if (prepareClockJob(entry.pipeline, parsed))
+        if (prepareBackgroundJob(entry.pipeline, parsed))
         {
             parsed.id = entry.id;
             parsed.startMs = entry.startMs;
@@ -1551,17 +1767,24 @@ static void serviceJobs()
                     pinMode(job.stages[s].p1, OUTPUT);
                     digitalWrite(job.stages[s].p1, LOW);
                 }
-            job.next = micros() + job.interval;
+            job.next = micros() + (job.adcWatch ? 0 : job.interval);
         }
         if ((long)(micros() - job.next) >= 0)
         {
             job.clockState = 1 - job.clockState;
-            int value = job.clockState;
+            int value = job.adcWatch ? analogRead(A0) : job.clockState;
+            if (job.adcWatch)
+            {
+                job.next = micros() + job.interval;
+                if (job.hasADC && job.lastADC == value) continue;
+                job.hasADC = true;
+                job.lastADC = value;
+            }
             bool hasValue = true;
             for (int s = 0; s < job.stageCount; ++s)
                 if (!applySignalStage(job.stages[s], hasValue, value))
                 { stopJob(job); break; }
-            if (job.active) job.next += job.interval;
+            if (job.active && !job.adcWatch) job.next += job.interval;
         }
     }
 }
@@ -1582,7 +1805,15 @@ static void handleCommand(const String &line)
         return;
     }
 
-    if (commandLine.indexOf('|') >= 0)
+    String backgroundArgs = commandLine;
+    String backgroundName = nextToken(backgroundArgs);
+    if (backgroundName.equalsIgnoreCase("adc") && backgroundArgs.indexOf("--watch") >= 0)
+    {
+        startClockJob(commandLine);
+        return;
+    }
+
+    if (unquotedIndex(commandLine, '|') >= 0)
     {
         String source = commandLine;
         String sourceName = nextToken(source);
@@ -1600,6 +1831,25 @@ static void handleCommand(const String &line)
 
     String command = nextToken(commandLine);
     command.toLowerCase();
+    if (lcdReady && (command == "read" || command == "write" || command == "shiftin" || command == "shiftout"))
+    {
+        String pins = commandLine;
+        int count = (command == "read" || command == "write") ? 1 : 3;
+        for (int i = 0; i < count; ++i)
+        {
+            int pin = toIntDef(nextToken(pins), -1);
+            if (pin == 4 || pin == 5)
+            {
+                commandOutput->println(F("ERROR: GPIO4/GPIO5 are reserved for LCD I2C"));
+                return;
+            }
+        }
+    }
+    if (command == "lcd")
+    {
+        handleLCDCommand(commandLine);
+        return;
+    }
     if (command == "help")
     {
         printHelp();
@@ -1798,19 +2048,24 @@ void loop()
                 handleCommand(inputBuffer);
                 inputBuffer = "";
                 inputBraceDepth = 0;
+                inputQuoted = inputEscaped = false;
             }
             else if (inputBuffer.length() > 0) inputBuffer += ' ';
         }
         else
         {
-            if (ch == '{') ++inputBraceDepth;
-            if (ch == '}') --inputBraceDepth;
+            if (inputQuoted && inputEscaped) inputEscaped = false;
+            else if (inputQuoted && ch == '\\') inputEscaped = true;
+            else if (ch == '"') inputQuoted = !inputQuoted;
+            else if (!inputQuoted && ch == '{') ++inputBraceDepth;
+            else if (!inputQuoted && ch == '}') --inputBraceDepth;
             inputBuffer += ch;
             if (inputBuffer.length() > 4096)
             {
                 Serial.println(F("ERROR: command too long"));
                 inputBuffer = "";
                 inputBraceDepth = 0;
+                inputQuoted = inputEscaped = false;
             }
         }
     }

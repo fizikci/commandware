@@ -25,6 +25,7 @@ class String {
 public:
     String(const char *s = "") : value(s) {}
     String(std::string s) : value(s) {}
+    String(int n) : value(std::to_string(n)) {}
     unsigned int length() const { return (unsigned int)value.size(); }
     char operator[](size_t i) const { return value[i]; }
     const char *c_str() const { return value.c_str(); }
@@ -62,7 +63,20 @@ unsigned long micros() { return (unsigned long)fakeUs; }
 void pinMode(int, int) {}
 void digitalWrite(int pin, int value) { gpio[pin] = value; writes.emplace_back(pin, value); }
 int digitalRead(int pin) { return gpio[pin]; }
-int analogRead(int) { return 512; }
+static int adcValue = 512;
+int analogRead(int) { return adcValue; }
+void delay(unsigned long) {}
+void delayMicroseconds(unsigned int) {}
+struct FakeWire {
+    int error = 0;
+    int sda = -1, scl = -1, address = 0;
+    std::vector<uint8_t> bytes;
+    void begin(int a, int b) { sda = a; scl = b; }
+    void setClock(int) {}
+    void beginTransmission(int a) { address = a; }
+    void write(uint8_t value) { bytes.push_back(value); }
+    int endTransmission() { return error; }
+} Wire;
 struct { int getFreeHeap() { return 10000; } } ESP;
 struct { int status() { return 3; } String localIP() { return "127.0.0.1"; } } WiFi;
 struct Job;
@@ -81,6 +95,8 @@ void fresh(uint64_t timeUs = 0) {
     pendingWritePulse = PendingWritePulse();
     Serial.input.clear(); Serial.position = 0;
     inputBuffer = ""; inputBraceDepth = 0;
+    inputQuoted = inputEscaped = false;
+    lcdReady = false; lcdAddress = 0x27; Wire = FakeWire(); adcValue = 512;
 }
 int activeJobs() { int count = 0; for (const auto &job : jobs) count += job.active; return count; }
 int queuedJobs() { int count = 0; for (const auto &entry : scheduled) count += entry.id != 0; return count; }
@@ -94,6 +110,45 @@ void rejected(const char *command) {
 }
 
 int main(int argc, char **argv) {
+    fresh(); handleCommand("lcd print \"Hello | World!\"");
+    assert(lcdReady && Wire.sda == 4 && Wire.scl == 5 && Wire.address == 0x27);
+    // Decode the real driver's RS data writes, including padding on both rows.
+    std::string displayed;
+    for (size_t i = 0; i + 5 < Wire.bytes.size(); i += 3)
+        if (Wire.bytes[i] & 1) {
+            displayed += char((Wire.bytes[i] & 0xf0) | (Wire.bytes[i + 3] >> 4));
+            i += 3;
+        }
+    assert(displayed == "Hello | World!                  ");
+    handleCommand("write 4 1"); assert(writes.empty());
+    Wire.bytes.clear(); handleCommand("adc A0 | lcd print");
+    assert(Serial.output.str().find("pipeline stage failure") == std::string::npos);
+    assert(Wire.bytes.size() == 34 * 6);
+
+    fresh(); handleCommand("lcd init 0x3f"); assert(lcdAddress == 0x3f && lcdReady);
+    handleCommand("lcd clear");
+    fresh(); Wire.error = 2; handleCommand("lcd print \"Hello\"");
+    assert(!lcdReady && Serial.output.str().find("ERROR:") != std::string::npos);
+    for (const char *invalid : {"lcd print", "lcd print \"oops", "lcd print \"ok\" extra", "lcd init 0", "lcd init 0x27 junk", "adc A0 --watch extra | lcd print"})
+        rejected(invalid);
+
+    fresh(); handleCommand("adc A0 --watch | lcd print");
+    assert(activeJobs() == 1); at(0); assert(lcdReady);
+    size_t written = Wire.bytes.size();
+    at(100000); assert(Wire.bytes.size() == written); // Unchanged ADC suppressed.
+    adcValue = 7; at(200000); assert(Wire.bytes.size() == written + 34 * 6);
+    handleCommand("jobs"); assert(Serial.output.str().find("1 RUNNING  adc A0 --watch") != std::string::npos);
+    handleCommand("kill 1"); adcValue = 8; at(300000); assert(!activeJobs());
+    assert(Wire.bytes.size() == written + 34 * 6);
+    fresh(); handleCommand("adc A0 --watch | print"); at(0); at(100000);
+    adcValue = 1; at(200000); handleCommand("reset"); assert(!activeJobs());
+    assert(Serial.output.str().find("512\n1\n") != std::string::npos);
+    fresh(); handleCommand("clock 1 | write 4"); handleCommand("lcd init");
+    assert(!lcdReady && activeJobs() == 1);
+    fresh(); handleCommand("schedule { 0 { lcd print \"a|{b}\" } }");
+    assert(queuedJobs() == 1); at(0); assert(lcdReady);
+    fresh(); Serial.input = "lcd print \"{Hello}\"\n"; loop(); assert(lcdReady);
+
     fresh();
     Serial.input = "schedule {\n 1000 {clock 1000 --dur 500 | write 15}\n";
     loop(); assert(!activeJobs());

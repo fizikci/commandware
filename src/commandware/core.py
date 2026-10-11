@@ -72,7 +72,7 @@ def parse_schedule(text: str) -> list[ScheduleEntry]:
     body = match[1]
     entries = []
     while body.strip():
-        entry = re.match(r"\s*([0-9]+)\s*\{([^{}]+)\}", body, re.S)
+        entry = re.match(r'\s*([0-9]+)\s*\{((?:"(?:\\.|[^"\\])*"|[^{}"])+)\}', body, re.S)
         if not entry or not entry[2].strip():
             raise ValueError("invalid schedule entry")
         entries.append(ScheduleEntry(_milliseconds(entry[1], True), entry[2].strip()))
@@ -138,6 +138,9 @@ class HardwareState:
     gpio: dict[int, int] = field(default_factory=dict)
     analog: dict[str, int] = field(default_factory=dict)
     pin_owners: dict[int, int] = field(default_factory=dict)
+    lcd_lines: list[str] = field(default_factory=lambda: [" " * 16, " " * 16])
+    lcd_history: list[list[str]] = field(default_factory=list)
+    lcd_address: int = 0x27
 
     def claim_pin(self, pin: object, job_id: int) -> None:
         pin_number = int(parse_pin(pin))
@@ -199,23 +202,48 @@ class Pipeline:
         return stream
 
 
+def _shell_tokens(text: str) -> list[str]:
+    # Decode row breaks before shlex removes double-quote/backslash escapes,
+    # so a literal escaped backslash followed by n stays literal.
+    text = re.sub(r'"(?:\\.|[^"\\])*"',
+                  lambda quoted: re.sub(r'\\[\\"n]',
+                                        lambda escape: "\n" if escape[0] == r"\n" else escape[0],
+                                        quoted[0]), text)
+    return shlex.split(text)
+
+
 def parse_pipeline(line: str) -> list[Command]:
     if not line or not line.strip():
         return []
     commands: list[Command] = []
-    for part in line.split("|"):
-        command_text = part.strip()
-        if not command_text:
-            continue
-        tokens = shlex.split(command_text)
+    start = 0
+    quote = None
+    escaped = False
+    parts = []
+    for index, char in enumerate(line):
+        if escaped:
+            escaped = False
+        elif char == "\\" and quote != "'":
+            escaped = True
+        elif quote:
+            if char == quote:
+                quote = None
+        elif char in {'"', "'"}:
+            quote = char
+        elif char == "|":
+            parts.append(line[start:index])
+            start = index + 1
+    parts.append(line[start:])
+    for part in parts:
+        tokens = _shell_tokens(part)
         if not tokens:
-            continue
-        commands.append(Command(name=tokens[0].lower(), args=tokens[1:]))
+            raise ValueError("empty pipeline stage")
+        commands.append(Command(tokens[0].lower(), tokens[1:]))
     return commands
 
 
 def parse_command_text(line: str) -> tuple[str, list[str]]:
-    tokens = shlex.split(line)
+    tokens = _shell_tokens(line)
     if not tokens:
         raise ValueError("Empty command")
     return tokens[0].lower(), tokens[1:]
@@ -235,11 +263,12 @@ def _read_pin(args: list[str], hardware: HardwareState, values: Sequence[object]
 
 
 def _adc(args: list[str], hardware: HardwareState, values: Sequence[object] | None = None) -> list[int]:
-    if not args:
-        raise ValueError("adc requires an analog pin")
+    if not args or args[0].upper() != "A0" or args[1:] not in ([], ["--watch"]):
+        raise ValueError("adc requires A0 [--watch]")
     pin = str(args[0]).upper()
     if values:
-        return [_as_int(value) for value in values]
+        readings = [_as_int(value) for value in values]
+        return _edge(readings) if args[1:] else readings
     return [hardware.read_analog(pin)]
 
 
@@ -435,6 +464,45 @@ def _print(values: Sequence[object]) -> list[object]:
     return list(values)
 
 
+def _lcd(args: list[str], hardware: HardwareState, values: Sequence[object]) -> list[object]:
+    if not args:
+        raise ValueError('use lcd init [ADDRESS], lcd print "TEXT", or lcd clear')
+    action = args[0].lower()
+    if action == "init":
+        if len(args) > 2:
+            raise ValueError("lcd init accepts an I2C address")
+        address = int(args[1], 0) if len(args) == 2 else 0x27
+        if not 0x08 <= address <= 0x77:
+            raise ValueError("invalid LCD I2C address")
+        hardware.lcd_address = address
+        hardware.lcd_lines = [" " * 16, " " * 16]
+        return []
+    if action == "clear" and len(args) == 1:
+        texts = [""]
+    elif action == "print" and len(args) <= 2:
+        if len(args) == 2 and values:
+            raise ValueError("lcd print takes text or piped input")
+        texts = [args[1]] if len(args) == 2 else [str(value) for value in values]
+        if not texts:
+            raise ValueError("lcd print requires text or piped input")
+    else:
+        raise ValueError("invalid LCD command")
+    for text in texts:
+        cells = [" "] * 32
+        pos = 0
+        for char in text:
+            if pos >= 32:
+                break
+            if char == "\n":
+                pos = 16 if pos < 16 else 32
+            else:
+                cells[pos] = char
+                pos += 1
+        hardware.lcd_lines = ["".join(cells[:16]), "".join(cells[16:])]
+        hardware.lcd_history.append(hardware.lcd_lines.copy())
+    return []
+
+
 def _shiftin(args: list[str], hardware: HardwareState, values: Sequence[object] | None = None) -> list[int]:
     if len(args) < 4:
         raise ValueError("shiftin requires DATA CLOCK LOAD bit_order")
@@ -462,7 +530,7 @@ def _system_help(_args: list[str], _values: Sequence[object] | None = None, **_:
         "help", "pins", "jobs", "kill", "status", "reset", "run", "schedule",
         "read", "write", "adc", "ohm", "clock", "map", "not", "edge",
         "rising", "falling", "debounce", "toggle", "divide", "pulse",
-        "print", "shiftin", "shiftout"
+        "print", "lcd", "shiftin", "shiftout"
     ]
 
 
@@ -529,6 +597,7 @@ COMMANDS: dict[str, Callable[..., list[object]]] = {
     "pulse": lambda args, values, hardware, jobs=None, job_id=None, count=None: _pulse(args, values),
     "write": lambda args, values, hardware, jobs=None, job_id=None, count=None: _write(args, hardware, values, job_id),
     "print": lambda args, values, hardware, jobs=None, job_id=None, count=None: _print(values),
+    "lcd": lambda args, values, hardware, jobs=None, job_id=None, count=None: _lcd(args, hardware, values),
     "shiftin": lambda args, values, hardware, jobs=None, job_id=None, count=None: _shiftin(args, hardware, values),
     "shiftout": lambda args, values, hardware, jobs=None, job_id=None, count=None: _shiftout(args, hardware, values),
     "help": _system_help,
@@ -560,8 +629,6 @@ def _simulate_schedule(entries: list[ScheduleEntry], hardware: HardwareState, jo
     allowed = set(COMMANDS) - {"run", "reset", "kill", "jobs"}
     for index, entry in enumerate(entries):
         commands = parse_pipeline(entry.pipeline)
-        if any(not part.strip() for part in entry.pipeline.split("|")):
-            raise ValueError("empty pipeline stage")
         if not commands or any(c.name not in allowed for c in commands):
             raise ValueError("unsupported scheduled command")
         frequency = duration = pin = None
@@ -570,9 +637,9 @@ def _simulate_schedule(entries: list[ScheduleEntry], hardware: HardwareState, jo
             frequency, duration, pin = _clock_options(commands[0].args)
             if duration is not None and entry.start_ms + duration > 2147483647:
                 raise ValueError("schedule deadline exceeds supported range")
-            if any(c.name not in {"map", "ohm", "not", "edge", "rising", "falling", "debounce", "toggle", "divide", "pulse", "write", "print"} for c in commands[1:]):
+            if any(c.name not in {"map", "ohm", "not", "edge", "rising", "falling", "debounce", "toggle", "divide", "pulse", "write", "print", "lcd"} for c in commands[1:]):
                 raise ValueError("unsupported clock pipeline stage")
-            if pin is not None and not any(c.name in {"write", "print"} for c in commands[1:]):
+            if pin is not None and not any(c.name in {"write", "print", "lcd"} for c in commands[1:]):
                 commands.append(Command("write", [str(pin)]))
             if len(commands) > 9:
                 raise ValueError("pipeline too long")

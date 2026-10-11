@@ -3,6 +3,51 @@ import pytest
 from pathlib import Path
 
 
+def test_lcd_literal_and_delimiters():
+    hw = HardwareState()
+    assert run_stream('LCD PRINT "Hello World!"', hardware=hw) == []
+    assert hw.lcd_lines == ["Hello World!    ", " " * 16]
+    run_stream('lcd print "|"', hardware=hw)
+    assert hw.lcd_lines[0] == "|" + " " * 15
+    run_stream('schedule { 0 { lcd print "a|{b}" } }', hardware=hw)
+    assert hw.lcd_lines[0] == "a|{b}" + " " * 11
+
+
+def test_lcd_watch_updates_changes_and_removes_stale_digits():
+    hw = HardwareState()
+    assert run_stream("adc A0 --watch | lcd print", [1023, 1023, 7], hardware=hw) == []
+    assert [rows[0] for rows in hw.lcd_history] == ["1023" + " " * 12, "7" + " " * 15]
+    assert hw.lcd_lines == ["7" + " " * 15, " " * 16]
+
+
+def test_lcd_wrap_clear_and_address():
+    hw = HardwareState()
+    run_stream('lcd init 0x3f', hardware=hw)
+    assert hw.lcd_address == 0x3f
+    run_stream('lcd print "1234567890123456abcdefghijklmnopEXTRA"', hardware=hw)
+    assert hw.lcd_lines == ["1234567890123456", "abcdefghijklmnop"]
+    run_stream(r'lcd print "first\nsecond"', hardware=hw)
+    assert hw.lcd_lines == ["first" + " " * 11, "second" + " " * 10]
+    run_stream(r'lcd print "slash\\n quote\""', hardware=hw)
+    assert hw.lcd_lines == ['slash\\n quote"'.ljust(16), " " * 16]
+    run_stream("lcd clear", hardware=hw)
+    assert hw.lcd_lines == [" " * 16, " " * 16]
+
+
+@pytest.mark.parametrize("command", ['lcd print', 'lcd init 0', 'lcd init 0x78', 'lcd clear extra', 'lcd bogus', 'adc A0 --watch extra | lcd print', 'adc A0 | lcd print extra extra'])
+def test_invalid_lcd_commands(command):
+    with pytest.raises(ValueError):
+        run_stream(command)
+
+
+def test_lcd_cli_preserves_shell_quoted_text(monkeypatch, capsys):
+    import io
+    from commandware.cli import main
+    monkeypatch.setattr("sys.stdin", io.StringIO(""))
+    assert main(["lcd", "print", "Hello World!"]) == 0
+    assert capsys.readouterr().out == ""
+
+
 def test_map_scales_values():
     result = run_stream("map 0 10 0 100", [0, 5, 10])
     assert result == [0, 50, 100]

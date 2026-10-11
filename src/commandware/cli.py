@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import shlex
 from typing import Sequence
 
 from .core import HardwareState, run_stream
@@ -34,7 +35,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("Usage: commandware <command> [args]", file=sys.stderr)
         return 1
 
-    command = " ".join(args)
+    # Preserve shell-quoted LCD text when rebuilding the command line.
+    # A single argument may also contain a complete Commandware pipeline.
+    command = args[0] if len(args) == 1 else shlex.join(args)
     values = _read_stdin_values()
     hardware = HardwareState()
     output = run_stream(command, values=values, hardware=hardware)

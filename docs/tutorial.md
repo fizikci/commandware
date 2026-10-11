@@ -146,6 +146,74 @@ adc A0 | map 0 1023 0 100 | print
 Scale the ADC reading to an integer from 0 to 100 and print it. This takes one
 reading per submission; it does not start a continuous ADC job.
 
+```text
+adc A0 --watch | print
+```
+
+Start a background ADC job that samples every 100 ms, emits the first reading,
+then emits only changes. Use `jobs`, `kill ID`, or `reset` to manage it. ADC
+watch jobs share the eight execution slots with clocks and can also start in a
+schedule block. Sampling uses the board's loop; it does not block the console.
+
+## Display text on an LCD
+
+The LCD command supports a **16×2 HD44780 character LCD with a PCF8574 I²C
+backpack**, using the common mapping P0=RS, P1=RW, P2=Enable, P3=backlight,
+P4–P7=D4–D7. It uses Arduino's bundled `Wire` library; no extra library is needed.
+Other backpack mappings and graphical LCD controllers are not supported.
+
+Connect SDA to **GPIO4**, SCL to **GPIO5**, and share ground. Power the module
+according to its specification. If its backpack pulls SDA/SCL up to 5 V, use a
+bidirectional I²C level shifter between it and the ESP8266's 3.3 V GPIO; do not
+connect a 5 V bus directly to the ESP8266. Adjust the backpack contrast
+potentiometer if the backlight lights but characters are invisible.
+
+```text
+lcd print "Hello World!"
+adc A0 --watch | lcd print
+```
+
+The first LCD command initializes address `0x27` automatically. If your backpack
+has another address, initialize it explicitly first (addresses are seven-bit):
+
+```text
+lcd init 0x3f
+lcd print "Hello World!"
+```
+
+Each print replaces the screen starting at its top-left corner. Text wraps after
+16 characters and is clipped after 32; unused cells are padded with spaces so a
+shorter number removes old digits. Double-quoted text preserves spaces, `|`,
+and braces. The escapes `\n`, `\"`, and `\\` represent a row break, a quote,
+and a backslash. LCD character ROM determines which non-ASCII characters display.
+
+```text
+lcd print "Temperature\n25 C"
+adc A0 | map 0 1023 0 100 | lcd print
+lcd clear
+schedule { 1000 { lcd print "Ready!" } }
+```
+
+`lcd print` consumes numeric pipeline values as decimal text. Its pipeline form
+accepts no literal text argument. Direct `lcd print "TEXT"`, `lcd init`, and
+`lcd clear` return `OK`; communication failures report an error. A failing LCD
+sink stops its background job. The last screen stays visible after `kill` or
+`reset`; use `lcd clear` to blank it.
+
+Once initialized, GPIO4/5 are reserved for LCD I²C. LCD initialization rejects
+running or queued clock/ADC GPIO writers on those pins. Kill conflicting jobs
+before initializing the display. LCD initialization takes about 60 ms once;
+subsequent screen writes use short synchronous I²C transfers, so they can delay
+clock edges. Avoid LCD updates in high-frequency clock pipelines.
+
+The Python simulator exposes `HardwareState.lcd_lines` (two padded rows) and
+`lcd_history` for inspection. A simulated ADC watch processes supplied readings,
+suppresses consecutive duplicates, and returns; without supplied readings it
+takes one virtual sample.
+
+The driver timing follows the [HD44780 datasheet](https://www.sparkfun.com/datasheets/LCD/HD44780.pdf)
+and uses the [PCF8574's 100 kHz I²C bus](https://www.nxp.com/docs/en/data-sheet/PCF8574_PCF8574A.pdf).
+
 ## Measure resistance
 
 

@@ -411,6 +411,23 @@ Print incoming values to terminal.
 adc A0 --watch | print
 ```
 
+### `lcd`
+
+Display text on a 16×2 HD44780 LCD with a PCF8574 I²C backpack:
+
+```text
+lcd print "Hello World!"
+adc A0 --watch | lcd print
+lcd init 0x3f
+lcd clear
+```
+
+Default address is `0x27`, SDA is GPIO4, and SCL is GPIO5. Each value replaces
+the screen, wraps at 16 columns, clips at 32 characters, and pads unused cells
+with spaces. ADC watch jobs sample every 100 ms and emit only changes after the
+first reading. See the [LCD tutorial](tutorial.md#display-text-on-an-lcd) for
+wiring, supported backpack mapping, and quoting rules.
+
 ---
 
 ### `shiftout`
@@ -662,7 +679,9 @@ Pipeline
 
 Do **not** implement a full Bash-style shell.
 
-No quoting rules, redirection, environment variables, subshells, etc. in v1.
+The LCD command adds double-quoted text with `\n`, `\"`, and `\\` escapes.
+Pipeline separators and schedule braces inside those strings are literal text.
+No redirection, environment variables, or subshells are implemented.
 
 ---
 
