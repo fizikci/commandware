@@ -31,4 +31,8 @@ subprocess.run([
     "/link", f"/LIBPATH:{tools / 'lib/x64'}",
     *(f"/LIBPATH:{kits / 'Lib' / sdk / part / 'x64'}" for part in ("ucrt", "um")),
 ], env=env, cwd=BUILD, check=True)
-subprocess.run([str(exe), str(ROOT / "examples/happy-birthday.cw")], check=True)
+tutorial = (ROOT / "docs/tutorial.md").read_text(encoding="utf-8")
+song = tutorial.split("## Happy Birthday\n", 1)[1].split("```text\n", 1)[1].split("```", 1)[0].strip()
+song_path = BUILD / "happy-birthday.cw"
+song_path.write_text(song, encoding="utf-8")
+subprocess.run([str(exe), str(song_path)], check=True)

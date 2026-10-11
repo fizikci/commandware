@@ -196,7 +196,8 @@ def test_schedule_executes_immediate_commands_in_time_order():
 
 
 def test_entire_happy_birthday_runs_in_one_schedule():
-    command = (Path(__file__).resolve().parents[1] / "examples/happy-birthday.cw").read_text()
+    tutorial = (Path(__file__).resolve().parents[1] / "docs/tutorial.md").read_text(encoding="utf-8")
+    command = tutorial.split("## Happy Birthday\n", 1)[1].split("```text\n", 1)[1].split("```", 1)[0].strip()
     assert len(parse_schedule(command)) == 25
     hw, manager = HardwareState(), JobManager()
     output = run_stream(command, hardware=hw, jobs=manager)
