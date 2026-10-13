@@ -45,7 +45,7 @@ private:
     String buffer;
 };
 
-static void handleCommand(const String &line);
+static void handleCommand(const String &line, uint16_t sourceLine = 1);
 static String trim(String value);
 
 static const char WEB_PAGE[] PROGMEM = R"rawliteral(
@@ -117,7 +117,7 @@ static const char WEB_PAGE[] PROGMEM = R"rawliteral(
     function remember(c){h=[c,...h.filter(x=>x!==c)].slice(0,12);if(!d.hidden)suggestions()}
     let requestQueue=Promise.resolve();
     function send(c){const request=requestQueue.then(async()=>{const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),10000);try{const x=await fetch('/api/command',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({command:c}),signal:controller.signal}),t=await x.text();if(!x.ok)throw Error(t||x.statusText);return t}catch(e){if(e.name==='AbortError')throw Error('Request timed out. Check device connection; command may have executed.');throw e}finally{clearTimeout(timer)}});requestQueue=request.catch(()=>{});return request}
-    async function refresh(){if(busy)return;busy=true;try{const t=await send('jobs'),a=t.split(/\r?\n/).map(s=>s.match(/^(\d+)\s+RUNNING\s+(.*)$/)).filter(Boolean);j.replaceChildren();if(!a.length){j.textContent='No jobs running.';return}a.forEach(m=>{const li=document.createElement('li'),b=document.createElement('button');li.append(document.createTextNode(`#${m[1]} ${m[2]} `));b.textContent='Kill';b.onclick=async()=>{b.disabled=true;try{r.textContent=await send(`kill ${m[1]}`);await refresh()}catch(e){r.textContent=`Request failed: ${e}`;b.disabled=false}};li.append(b);j.append(li)})}catch(e){j.textContent=`Unable to load jobs: ${e}`}finally{busy=false}}
+    async function refresh(){if(busy)return;busy=true;try{const t=await send('jobs'),a=t.split(/\r?\n/).map(s=>s.match(/^(\d+)\s+(RUNNING|FAILED)\s+(.*)$/)).filter(Boolean);j.replaceChildren();if(!a.length){j.textContent='No jobs running.';return}a.forEach(m=>{const li=document.createElement('li'),b=document.createElement('button');li.append(document.createTextNode(`#${m[1]} ${m[2]} ${m[3]} `));b.textContent='Kill';b.onclick=async()=>{b.disabled=true;try{r.textContent=await send(`kill ${m[1]}`);await refresh()}catch(e){r.textContent=`Request failed: ${e}`;b.disabled=false}};if(m[2]==='RUNNING')li.append(b);j.append(li)})}catch(e){j.textContent=`Unable to load jobs: ${e}`}finally{busy=false}}
     a.onclick=()=>{if(i.value)i.value='';openSuggestions();i.focus()};i.onfocus=()=>openSuggestions();i.oninput=()=>openSuggestions();document.addEventListener('click',e=>{if(!e.target.closest('.command-entry'))closeSuggestions()});document.addEventListener('keydown',e=>{if(e.key==='Escape')closeSuggestions()});f.onsubmit=async e=>{e.preventDefault();const c=i.value.trim();r.textContent='Running...';closeSuggestions();try{r.textContent=await send(c);remember(c);await refresh()}catch(x){r.textContent=`Request failed: ${x}`}};closeSuggestions();refresh();setInterval(refresh,3000);
   </script>
 </body>
@@ -133,7 +133,7 @@ static void configureWebServer()
                      String command = webServer.arg("command");
                      if (trim(command).length() == 0)
                      {
-                         webServer.send(400, "text/plain; charset=utf-8", "ERROR: command is required");
+                         webServer.send(400, "text/plain; charset=utf-8", "ERROR: command is required at line 1");
                          return;
                      }
 
@@ -194,7 +194,58 @@ enum StageKind
     STAGE_WRITE,
     STAGE_PRINT,
     STAGE_LCD_PRINT,
+    STAGE_OLED,
 };
+
+#include "ScriptRuntime.h"
+#include "OledDisplay.h"
+static cw::OledDisplay oledDisplay;
+// Legacy command handlers also pass through this stream, so even errors from
+// commands outside the script interpreter carry a location.
+static uint16_t commandErrorLine = 1;
+class ErrorLinePrint : public Print
+{
+    Print &destination;
+    String line;
+public:
+    explicit ErrorLinePrint(Print &target) : destination(target) {}
+    size_t write(uint8_t value) override
+    {
+        if (value == '\n') flushLine(true);
+        else if (value != '\r') line += (char)value;
+        return 1;
+    }
+    void flushLine(bool newline = false)
+    {
+        destination.print(line);
+        if (line.startsWith("ERROR:") && line.indexOf(" at line ") < 0)
+        {
+            destination.print(F(" at line "));
+            destination.print(commandErrorLine);
+        }
+        if (newline) destination.print('\n');
+        line = "";
+    }
+};
+
+class ErrorOutputScope
+{
+    Print *previous;
+    uint16_t previousLine;
+    ErrorLinePrint output;
+public:
+    explicit ErrorOutputScope(uint16_t sourceLine = 1)
+        : previous(commandOutput), previousLine(commandErrorLine), output(*previous)
+    { commandOutput = &output; commandErrorLine = sourceLine; }
+    ~ErrorOutputScope()
+    { output.flushLine(); commandOutput = previous; commandErrorLine = previousLine; }
+};
+static cw::Runtime scriptRuntime;
+static std::map<int, unsigned long> scriptPinOwners;
+static std::map<int, bool> scriptOutputPins;
+static void configureScriptRuntime();
+static bool scriptOwnsPin(int pin) { return scriptPinOwners.count(pin) != 0; }
+static bool displayReservesPin(int pin);
 
 struct Stage
 {
@@ -209,6 +260,7 @@ struct Stage
     int counter = 0;
     int toggleState = 0;
     int pulseRemaining = 0;
+    std::shared_ptr<std::vector<cw::Value>> oledArgs;
 };
 
 struct Job
@@ -219,6 +271,7 @@ struct Job
     bool isClock = true;
     bool adcWatch = false;
     bool hasADC = false;
+    uint16_t line = 1;
     int lastADC = 0;
     unsigned long startMs = 0;
     unsigned long durationMs = 0; // Zero means unlimited.
@@ -239,6 +292,7 @@ struct ScheduledCommand
     unsigned long durationMs = 0;
     unsigned long pinMask = 0;
     bool isClock = false;
+    uint16_t line = 1;
     String pipeline;
 };
 static ScheduledCommand scheduled[MAX_SCHEDULED_COMMANDS];
@@ -255,6 +309,10 @@ static String inputBuffer;
 static int inputBraceDepth = 0;
 static bool inputQuoted = false;
 static bool inputEscaped = false;
+static char inputQuoteChar = 0;
+static bool inputComment = false;
+static bool inputAfterCR = false;
+static uint16_t inputLine = 1;
 
 struct PendingWritePulse
 {
@@ -348,6 +406,7 @@ static int mapValue(int value, int inMin, int inMax, int outMin, int outMax)
 static bool lcdReady = false;
 static uint8_t lcdAddress = 0x27;
 static const unsigned long LCD_PIN_MASK = (1UL << 4) | (1UL << 5);
+static bool displayReservesPin(int pin) { return (lcdReady || oledDisplay.reserved) && (pin == 4 || pin == 5); }
 
 static bool lcdNibble(uint8_t value)
 {
@@ -375,6 +434,14 @@ static bool lcdFailure()
 
 static bool initLCD(uint8_t address)
 {
+    if (oledDisplay.reserved && address == oledDisplay.address) {
+        commandOutput->println(F("ERROR: LCD address is already used by OLED")); return false;
+    }
+    if (scriptOwnsPin(4) || scriptOwnsPin(5))
+    {
+        commandOutput->println(F("ERROR: LCD pins are owned by a script job"));
+        return false;
+    }
     // Do not take the bus pins away from running or queued GPIO writers.
     for (int i = 0; i < 8; ++i)
         if (jobs[i].active)
@@ -514,6 +581,9 @@ static void printHelp()
     commandOutput->println(F("adc A0 [--watch] (watch samples changes every 100 ms)"));
     commandOutput->println(F("lcd init [ADDRESS] (16x2 I2C, default 0x27; SDA=4 SCL=5)"));
     commandOutput->println(F("lcd print \"TEXT\"; lcd clear; SOURCE | lcd print"));
+    commandOutput->println(F("oled init [ssd1306|sh1106] [--height 32|64] [--address 0x3c|0x3d]"));
+    commandOutput->println(F("oled print [X Y] [TEXT] [--x 0 --y 0]; oled clear"));
+    commandOutput->println(F("SOURCE | oled chart [VALUE] [--min 0 --max 1023 --x 0 --y 0 --width 128 --height 64]"));
     commandOutput->println(F("ohm [A0] (ohms, <270, >700k, OUT_OF_RANGE)"));
     commandOutput->println(F("adc A0 | ohm (terminal measurement stage)"));
     commandOutput->println(F("clock HZ [PIN] [--dur MILLISECONDS]"));
@@ -530,6 +600,13 @@ static void printHelp()
     commandOutput->println(F("print VALUE"));
     commandOutput->println(F("shiftin DATA CLOCK LOAD [msb|lsb] [BITS]"));
     commandOutput->println(F("shiftout DATA CLOCK LATCH [msb|lsb] VALUE"));
+    commandOutput->println(F("do { COMMAND; COMMAND; ... }"));
+    commandOutput->println(F("every MILLISECONDS | COMMAND | ..."));
+    commandOutput->println(F("var NAME EXPR / set NAME EXPR (read with $NAME)"));
+    commandOutput->println(F("func NAME [PARAM...] { BODY } / call NAME [ARG...]"));
+    commandOutput->println(F("split DELIM [VALUE | --value VALUE] [--out NAME,...]"));
+    commandOutput->println(F("each [--out NAME] [ { BODY } ] (sequential)"));
+    commandOutput->println(F("tone PIN --hz HZ --dur MS / sleep MS"));
 }
 
 static void printPins()
@@ -546,9 +623,14 @@ static void printPins()
         {
             commandOutput->println(F("terminal"));
         }
-        else if (lcdReady && (pins[i] == 4 || pins[i] == 5))
+        else if (displayReservesPin(pins[i]))
         {
-            commandOutput->println(F("LCD I2C"));
+            commandOutput->println(oledDisplay.reserved ? F("OLED I2C") : F("LCD I2C"));
+        }
+        else if (scriptOwnsPin(pins[i]))
+        {
+            commandOutput->print(F("script job "));
+            commandOutput->println(scriptPinOwners[pins[i]]);
         }
         else
         {
@@ -559,6 +641,20 @@ static void printPins()
 
 static void printJobs()
 {
+    for (const auto &failure : scriptRuntime.failures)
+    {
+        commandOutput->print(failure.id);
+        commandOutput->print(F(" FAILED  "));
+        commandOutput->print(failure.label.c_str());
+        commandOutput->print(F(": "));
+        commandOutput->println(failure.message.c_str());
+    }
+    for (const auto &task : scriptRuntime.tasks)
+    {
+        commandOutput->print(task->id);
+        commandOutput->print(F(" RUNNING  "));
+        commandOutput->println(task->label.c_str());
+    }
     for (int i = 0; i < 8; ++i)
     {
         if (!jobs[i].active)
@@ -781,6 +877,13 @@ static bool applySignalStage(Stage &stage, bool &hasValue, int &value)
         return true;
     case STAGE_LCD_PRINT:
         return printLCD(String(value));
+    case STAGE_OLED:
+    {
+        cw::Event event; event.hasValue = hasValue; event.value = cw::Value(value);
+        std::string error;
+        if (oledDisplay.command(*stage.oledArgs, event, commandErrorLine, (uint32_t)millis(), error)) return true;
+        commandOutput->print(F("ERROR: ")); commandOutput->println(error.c_str()); return false;
+    }
     default:
         return false;
     }
@@ -788,6 +891,18 @@ static bool applySignalStage(Stage &stage, bool &hasValue, int &value)
 
 static bool parsePipelineStage(const String &stageText, Stage &stage)
 {
+    String oledText = stageText;
+    if (nextToken(oledText).equalsIgnoreCase("oled")) {
+        std::string error; cw::Parser parser(error); auto body = parser.parse(stageText.c_str());
+        if (!error.empty() || body.size() != 1 || body[0].size() != 1 || !body[0][0]->body.empty() || body[0][0]->args.empty()) return false;
+        auto args = std::make_shared<std::vector<cw::Value>>();
+        cw::Scope scope; cw::Event event;
+        for (const auto &token : body[0][0]->args) {
+            args->push_back(cw::expressionToken(token) ? cw::Expression(token.text, scope, event, error).run() : cw::Value(token.text));
+            if (!error.empty()) return false;
+        }
+        stage.kind = STAGE_OLED; stage.oledArgs = args; return true;
+    }
     String args = stageText;
     String name = nextToken(args);
     name.toLowerCase();
@@ -860,7 +975,7 @@ static bool parsePipelineStage(const String &stageText, Stage &stage)
     if (name == "write")
     {
         int pin = toIntDef(nextToken(args), -1);
-        if (pin < 0 || (lcdReady && (pin == 4 || pin == 5)))
+        if (pin < 0 || scriptOwnsPin(pin) || displayReservesPin(pin))
         {
             return false;
         }
@@ -1163,6 +1278,12 @@ static void handleKillCommand(String args)
         commandOutput->println(F("ERROR: kill requires valid job id"));
         return;
     }
+    if (scriptRuntime.kill((unsigned long)id))
+    {
+        commandOutput->print(F("killed "));
+        commandOutput->println(id);
+        return;
+    }
     for (int i = 0; i < 8; ++i)
         if (jobs[i].active && jobs[i].id == (unsigned long)id)
         {
@@ -1192,9 +1313,9 @@ static bool evaluateImmediateSource(const String &sourceText, bool &hasValue, in
     if (name == "read")
     {
         int pin = toIntDef(nextToken(args), -1);
-        if (lcdReady && (pin == 4 || pin == 5))
+        if (scriptOwnsPin(pin) || displayReservesPin(pin))
         {
-            commandOutput->println(F("ERROR: GPIO4/GPIO5 are reserved for LCD I2C"));
+            commandOutput->println(F("ERROR: GPIO4/GPIO5 are reserved for display I2C"));
             return false;
         }
         if (pin < 0)
@@ -1247,9 +1368,9 @@ static bool evaluateImmediateSource(const String &sourceText, bool &hasValue, in
     if (name == "write")
     {
         int pin = toIntDef(nextToken(args), -1);
-        if (lcdReady && (pin == 4 || pin == 5))
+        if (scriptOwnsPin(pin) || displayReservesPin(pin))
         {
-            commandOutput->println(F("ERROR: GPIO4/GPIO5 are reserved for LCD I2C"));
+            commandOutput->println(F("ERROR: GPIO4/GPIO5 are reserved for display I2C"));
             return false;
         }
         if (pin < 0)
@@ -1304,7 +1425,7 @@ static void runImmediatePipeline(const String &line)
             commandOutput->println(F("'"));
             return;
         }
-        if (stage.kind == STAGE_WRITE || stage.kind == STAGE_PRINT || stage.kind == STAGE_LCD_PRINT)
+        if (stage.kind == STAGE_WRITE || stage.kind == STAGE_PRINT || stage.kind == STAGE_LCD_PRINT || stage.kind == STAGE_OLED)
         {
             hasSink = true;
         }
@@ -1362,7 +1483,7 @@ static ClockWindow clockWindow(const Job &job)
     for (int i = 0; i < job.stageCount; ++i)
         if (job.stages[i].kind == STAGE_WRITE)
             result.pinMask |= 1UL << job.stages[i].p1;
-        else if (job.stages[i].kind == STAGE_LCD_PRINT)
+        else if (job.stages[i].kind == STAGE_LCD_PRINT || job.stages[i].kind == STAGE_OLED)
             result.pinMask |= LCD_PIN_MASK | (1UL << 18);
     return result;
 }
@@ -1518,7 +1639,7 @@ static bool prepareClockJob(const String &line, Job &job)
             commandOutput->println(F("ERROR: invalid clock output pin"));
             return false;
         }
-        if (stage.kind == STAGE_WRITE || stage.kind == STAGE_PRINT || stage.kind == STAGE_LCD_PRINT)
+        if (stage.kind == STAGE_WRITE || stage.kind == STAGE_PRINT || stage.kind == STAGE_LCD_PRINT || stage.kind == STAGE_OLED)
         {
             hasSink = true;
         }
@@ -1527,9 +1648,9 @@ static bool prepareClockJob(const String &line, Job &job)
 
     if (!hasSink && fallbackPin >= 0)
     {
-        if (lcdReady && (fallbackPin == 4 || fallbackPin == 5))
+        if (scriptOwnsPin(fallbackPin) || displayReservesPin(fallbackPin))
         {
-            commandOutput->println(F("ERROR: GPIO4/GPIO5 are reserved for LCD I2C"));
+            commandOutput->println(F("ERROR: GPIO4/GPIO5 are reserved for display I2C"));
             return false;
         }
         Stage writeStage;
@@ -1587,10 +1708,11 @@ static bool prepareBackgroundJob(const String &line, Job &job)
     return true;
 }
 
-static void startClockJob(const String &line)
+static bool startClockJob(const String &line)
 {
     Job job;
-    if (!prepareBackgroundJob(line, job)) return;
+    if (!prepareBackgroundJob(line, job)) return false;
+    job.line = commandErrorLine;
     job.startMs = millis();
     ScheduledCommand proposed;
     proposed.pipeline = job.pipeline;
@@ -1598,7 +1720,7 @@ static void startClockJob(const String &line)
     proposed.startMs = job.startMs;
     proposed.durationMs = job.durationMs;
     proposed.pinMask = clockWindow(job).pinMask;
-    if (!validatePlan(&proposed, 1, job.startMs)) return;
+    if (!validatePlan(&proposed, 1, job.startMs)) return false;
     for (int i = 0; i < 8; ++i)
         if (!jobs[i].active)
         {
@@ -1606,38 +1728,52 @@ static void startClockJob(const String &line)
             jobs[i] = job;
             commandOutput->print(F("Started job "));
             commandOutput->println(job.id);
-            return;
+            return true;
         }
     commandOutput->println(F("ERROR: no free jobs"));
+    return false;
 }
 
-static void startSchedule(String text)
+static bool startSchedule(String text)
 {
     text = trim(text);
     if (!text.startsWith("{") || !text.endsWith("}"))
     {
         commandOutput->println(F("ERROR: schedule requires { START_MS { COMMAND } ... }"));
-        return;
+        return false;
     }
-    text = trim(text.substring(1, text.length() - 1));
+    text = text.substring(1, text.length() - 1);
+    uint16_t sourceLine = commandErrorLine;
     // Store only command text and timing for future notes; compiled stages
     // occupy the eight execution slots only while their clocks are running.
     ScheduledCommand *queued = new (std::nothrow) ScheduledCommand[MAX_SCHEDULED_COMMANDS];
     if (!queued)
     {
         commandOutput->println(F("ERROR: not enough memory for schedule"));
-        return;
+        return false;
     }
     int count = 0;
     bool valid = true;
     while (text.length() && valid)
     {
+        unsigned int leading = 0;
+        while (leading < text.length() && isspace((unsigned char)text[leading]))
+            if (text[leading++] == '\n') ++sourceLine;
+        text = text.substring(leading);
+        if (!text.length()) break;
+        commandErrorLine = sourceLine;
         int open = unquotedIndex(text, '{'), close = unquotedIndex(text, '}');
         unsigned long offset;
         if (count == MAX_SCHEDULED_COMMANDS || open < 0 || close < open ||
             !parseMilliseconds(trim(text.substring(0, open)), offset, true))
         { valid = false; break; }
         String pipeline = trim(text.substring(open + 1, close));
+        uint16_t pipelineLine = sourceLine;
+        unsigned int commandStart = open + 1;
+        while (commandStart < (unsigned int)close && isspace((unsigned char)text[commandStart])) ++commandStart;
+        for (unsigned int i = 0; i < commandStart; ++i) if (text[i] == '\n') ++pipelineLine;
+        commandErrorLine = pipelineLine;
+        queued[count].line = pipelineLine;
         if (!pipeline.length() || unquotedIndex(pipeline, '{') >= 0)
         { valid = false; break; }
         String args = pipeline;
@@ -1654,7 +1790,7 @@ static void startSchedule(String text)
         else
         {
             // Immediate commands run once when their deadline arrives.
-            const String allowed = " read write adc ohm lcd map not edge rising falling debounce toggle divide pulse print shiftin shiftout status pins help ";
+            const String allowed = " read write adc ohm lcd oled map not edge rising falling debounce toggle divide pulse print shiftin shiftout status pins help ";
             if (allowed.indexOf(String(" ") + name + " ") < 0)
             { valid = false; break; }
             String parts[10];
@@ -1676,7 +1812,8 @@ static void startSchedule(String text)
         if (queued[count].durationMs > 2147483647UL - offset)
         { valid = false; break; }
         queued[count++].startMs = offset;
-        text = trim(text.substring(close + 1));
+        for (int i = 0; i <= close; ++i) if (text[i] == '\n') ++sourceLine;
+        text = text.substring(close + 1);
     }
     int freeCount = 0;
     for (int i = 0; i < MAX_SCHEDULED_COMMANDS; ++i) if (!scheduled[i].id) ++freeCount;
@@ -1684,14 +1821,14 @@ static void startSchedule(String text)
     {
         delete[] queued;
         commandOutput->println(F("ERROR: invalid schedule or queue full (maximum 32 pending entries)"));
-        return;
+        return false;
     }
     unsigned long base = millis();
     for (int i = 0; i < count; ++i) queued[i].startMs += base;
     if (!validatePlan(queued, count, base))
     {
         delete[] queued;
-        return;
+        return false;
     }
     int entry = 0;
     for (int i = 0; i < MAX_SCHEDULED_COMMANDS && entry < count; ++i)
@@ -1703,9 +1840,10 @@ static void startSchedule(String text)
             commandOutput->println(scheduled[i].id);
         }
     delete[] queued;
+    return true;
 }
 
-static void serviceJobs()
+static void executeJobs()
 {
     unsigned long now = millis();
     // Finish every expired note before starting any note at the same boundary.
@@ -1723,6 +1861,7 @@ static void serviceJobs()
                 first = i;
         if (first < 0) break;
         ScheduledCommand &entry = scheduled[first];
+        commandErrorLine = entry.line;
         if (entry.durationMs && (long)(now - (entry.startMs + entry.durationMs)) >= 0)
         {
             entry = ScheduledCommand(); // Skip a note whose entire window was missed.
@@ -1731,8 +1870,9 @@ static void serviceJobs()
         if (!entry.isClock)
         {
             String command = entry.pipeline;
+            uint16_t sourceLine = entry.line;
             entry = ScheduledCommand();
-            handleCommand(command);
+            handleCommand(command, sourceLine);
             continue;
         }
         int slot = -1;
@@ -1743,6 +1883,7 @@ static void serviceJobs()
         {
             parsed.id = entry.id;
             parsed.startMs = entry.startMs;
+            parsed.line = entry.line;
             jobs[slot] = parsed;
         }
         entry = ScheduledCommand();
@@ -1750,12 +1891,13 @@ static void serviceJobs()
     for (int i = 0; i < 8; ++i)
     {
         Job &job = jobs[i];
+        commandErrorLine = job.line;
         if (!job.active || (long)(now - job.startMs) < 0) continue;
         if (!job.isClock)
         {
             String command = job.pipeline;
             stopJob(job);
-            handleCommand(command);
+            handleCommand(command, job.line);
             continue;
         }
         if (!job.started)
@@ -1789,7 +1931,157 @@ static void serviceJobs()
     }
 }
 
-static void handleCommand(const String &line)
+static void serviceJobs()
+{
+    ErrorOutputScope output;
+    executeJobs();
+}
+
+static bool scriptClaimPin(int pin, unsigned long owner)
+{
+    // UART and flash pins are unavailable to script hardware commands.
+    if (pin < 0 || pin > 16 || pin == 1 || pin == 3 || (pin >= 6 && pin <= 11)) return false;
+    if (displayReservesPin(pin)) return false;
+    auto existing = scriptPinOwners.find(pin);
+    if (existing != scriptPinOwners.end()) return existing->second == owner;
+    unsigned long mask = 1UL << pin;
+    for (const auto &job : jobs)
+        if (job.active && (clockWindow(job).pinMask & mask)) return false;
+    for (const auto &entry : scheduled)
+        if (entry.id && (entry.pinMask & mask)) return false;
+    if (pendingWritePulse.active && pendingWritePulse.pin == pin) return false;
+    scriptPinOwners[pin] = owner;
+    return true;
+}
+
+static void configureScriptRuntime()
+{
+    oledDisplay.begin = [](int address, std::string &error) {
+        if (lcdReady && address == lcdAddress) { error = "oled: address is already used by LCD"; return false; }
+        if (scriptOwnsPin(4) || scriptOwnsPin(5)) { error = "oled: I2C pins are owned by a script job"; return false; }
+        for (const auto &job : jobs) if (job.active)
+            for (int i = 0; i < job.stageCount; ++i)
+                if (job.stages[i].kind == STAGE_WRITE && (job.stages[i].p1 == 4 || job.stages[i].p1 == 5))
+                { error = "oled: I2C pins are used by a running job"; return false; }
+        for (const auto &entry : scheduled) if (entry.id && (entry.pinMask & LCD_PIN_MASK))
+            { error = "oled: I2C pins are reserved by a queued job"; return false; }
+        if (pendingWritePulse.active && (pendingWritePulse.pin == 4 || pendingWritePulse.pin == 5))
+            { error = "oled: I2C pins are used by a pulse"; return false; }
+        Wire.begin(4, 5);
+        Wire.setClock(lcdReady ? 100000 : 400000);
+        return true;
+    };
+    oledDisplay.send = [](uint8_t address, uint8_t control, const uint8_t *bytes, size_t count) {
+        Wire.beginTransmission(address); Wire.write(control);
+        for (size_t i = 0; i < count; ++i) if (Wire.write(bytes[i]) != 1) { Wire.endTransmission(); return false; }
+        return Wire.endTransmission() == 0;
+    };
+    scriptRuntime.background = [](const std::string &text) {
+        ErrorOutputScope output(scriptRuntime.executingLine);
+        return startClockJob(String(text.c_str()));
+    };
+    scriptRuntime.schedule = [](const std::string &text) {
+        ErrorOutputScope output(scriptRuntime.executingLine);
+        return startSchedule(String(text.c_str()));
+    };
+    scriptRuntime.newId = []() { return nextJobId++; };
+    scriptRuntime.output = [](const std::string &s) { commandOutput->println(s.c_str()); };
+    scriptRuntime.claim = scriptClaimPin;
+    scriptRuntime.write = [](int pin, int value) {
+        scriptOutputPins[pin] = true;
+        pinMode(pin, OUTPUT); digitalWrite(pin, value ? HIGH : LOW);
+    };
+    scriptRuntime.release = [](unsigned long id) {
+        for (auto it = scriptPinOwners.begin(); it != scriptPinOwners.end();)
+            if (it->second == id) {
+                if (scriptOutputPins.count(it->first)) {
+                    pinMode(it->first, OUTPUT); digitalWrite(it->first, LOW);
+                    scriptOutputPins.erase(it->first);
+                }
+                it = scriptPinOwners.erase(it);
+            } else ++it;
+    };
+    scriptRuntime.host = [](const std::string &name, const std::vector<cw::Value> &supplied, cw::Event &event,
+                            unsigned long id, std::string &error) {
+        ErrorOutputScope output(scriptRuntime.executingLine);
+        if (name == "oled") return oledDisplay.command(supplied, event, scriptRuntime.executingLine, (uint32_t)millis(), error);
+        auto args = supplied;
+        cw::Value input = event.value;
+        for (size_t i = 0; i < args.size(); ++i) if (args[i].str() == "--value") {
+            if (i + 2 != args.size()) { error = "--value requires one value at end"; return false; }
+            input = args[i+1]; args.resize(i); break;
+        }
+        auto number = [&](const cw::Value &v) {
+            if (v.kind != cw::Value::NUMBER || !std::isfinite(v.number) || v.number < -2147483647.0 || v.number > 2147483647.0) {
+                error = "command requires numeric input"; return 0;
+            }
+            return (int)v.number;
+        };
+        auto pin = [&](const cw::Value &v) {
+            int p = number(v);
+            if (error.empty() && (!scriptClaimPin(p, id) || v.number != p)) error = "GPIO is invalid or reserved";
+            return p;
+        };
+        if (name == "adc" && args.size() == 1 && cw::lower(args[0].str()) == "a0") {
+            event.value = cw::Value(analogRead(A0)); return true;
+        }
+        if (name == "read" && args.size() == 1) {
+            int p = pin(args[0]); if (!error.empty()) return false;
+            pinMode(p, INPUT); event.value = cw::Value(digitalRead(p)); return true;
+        }
+        if (name == "write" && (args.size() == 1 || args.size() == 2)) {
+            int p = pin(args[0]), value = number(args.size() == 2 ? args[1] : input);
+            if (!error.empty()) return false;
+            scriptOutputPins[p] = true;
+            pinMode(p, OUTPUT); digitalWrite(p, value ? HIGH : LOW); event.value = cw::Value(value != 0); return true;
+        }
+        if (name == "map" && args.size() == 4) {
+            int a = number(args[0]), b = number(args[1]), c = number(args[2]), d = number(args[3]), v = number(input);
+            if (!error.empty()) return false;
+            if (a == b) { error = "map input range cannot be zero"; return false; }
+            event.value = cw::Value(c + (double(v) - a) * (double(d) - c) / (double(b) - a));
+            event.value.number = std::trunc(event.value.number); return true;
+        }
+        if (name == "not" && args.empty()) {
+            event.value = cw::Value(number(input) == 0); return error.empty();
+        }
+        if (name == "print" && args.size() <= 1) {
+            commandOutput->println((args.empty() ? input.str() : args[0].str()).c_str()); return true;
+        }
+        if (name == "lcd" && !args.empty()) {
+            std::string action = cw::lower(args[0].str());
+            if (action == "init" && args.size() <= 2) {
+                int address = args.size() == 2 ? number(args[1]) : 0x27;
+                if (address < 8 || address > 0x77) error = "invalid LCD I2C address";
+                if (error.empty() && initLCD((uint8_t)address)) return true;
+            } else if ((action == "print" && args.size() <= 2) || (action == "clear" && args.size() == 1)) {
+                std::string text = action == "clear" ? "" : args.size() == 2 ? args[1].str() : input.str();
+                if (printLCD(String(text.c_str()))) return true;
+            }
+            if (error.empty()) error = "LCD command failed";
+            return false;
+        }
+        if (name == "ohm" && args.empty()) {
+            // Match the numeric portion of the existing calibrated conversion.
+            int raw = number(input);
+            if (!error.empty()) return false;
+            if (raw < 0 || raw > 1023) event.value = cw::Value(std::string("OUT_OF_RANGE"));
+            else if (raw < 30) event.value = cw::Value(std::string("<270"));
+            else if (raw > 720) event.value = cw::Value(std::string(">700k"));
+            else {
+                const int counts[] = {50,179,291,459,557,628,703,720};
+                const double resistance[] = {270,995,1992,5152,9959,20020,108800,688900};
+                int index = 0; while (index < 6 && raw > counts[index+1]) ++index;
+                double fraction = double(raw-counts[index]) / (counts[index+1]-counts[index]);
+                event.value = cw::Value(std::floor(resistance[index] * exp(fraction * log(resistance[index+1]/resistance[index])) + 0.5));
+            }
+            return true;
+        }
+        error = "invalid arguments for '" + name + "'"; return false;
+    };
+}
+
+static void executeCommand(const String &line)
 {
     String commandLine = trim(line);
     if (commandLine.length() == 0)
@@ -1799,9 +2091,36 @@ static void handleCommand(const String &line)
 
     String scheduleArgs = commandLine;
     String scheduleName = nextToken(scheduleArgs);
-    if (scheduleName.equalsIgnoreCase("schedule"))
+    if (scheduleName.equalsIgnoreCase("schedule") && commandLine.indexOf('$') < 0)
     {
+        int brace = unquotedIndex(line, '{');
+        for (int i = 0; i < brace; ++i) if (line[i] == '\n') ++commandErrorLine;
         startSchedule(scheduleArgs);
+        return;
+    }
+
+    std::string first = cw::lower(scheduleName.c_str());
+    const std::string scriptCommands = " do func call var set every each split sleep tone oled ";
+    bool scriptPipeline = scriptCommands.find(" " + first + " ") != std::string::npos;
+    for (int separator = unquotedIndex(commandLine, '|'); !scriptPipeline && separator >= 0;
+         separator = unquotedIndex(commandLine, '|', separator + 1))
+    {
+        String remaining = commandLine.substring(separator + 1);
+        std::string name = cw::lower(nextToken(remaining).c_str());
+        scriptPipeline = !name.empty() && scriptCommands.find(" " + name + " ") != std::string::npos;
+    }
+    if (scriptPipeline ||
+        commandLine.indexOf('$') >= 0 || commandLine.indexOf("--out") >= 0 ||
+        line.indexOf('\n') >= 0 || commandLine.indexOf(';') >= 0 || commandLine.startsWith("#"))
+    {
+        configureScriptRuntime();
+        std::string source(commandErrorLine - 1, '\n');
+        source += line.c_str();
+        if (!scriptRuntime.submit(source, (uint32_t)millis(), (uint32_t)micros()))
+        {
+            commandOutput->print(F("ERROR: "));
+            commandOutput->println(scriptRuntime.error.c_str());
+        }
         return;
     }
 
@@ -1831,7 +2150,18 @@ static void handleCommand(const String &line)
 
     String command = nextToken(commandLine);
     command.toLowerCase();
-    if (lcdReady && (command == "read" || command == "write" || command == "shiftin" || command == "shiftout"))
+    if (command == "read" || command == "write" || command == "shiftin" || command == "shiftout")
+    {
+        String pins = commandLine;
+        int count = (command == "read" || command == "write") ? 1 : 3;
+        for (int i = 0; i < count; ++i)
+            if (scriptOwnsPin(toIntDef(nextToken(pins), -1)))
+            {
+                commandOutput->println(F("ERROR: GPIO is owned by a script job"));
+                return;
+            }
+    }
+    if ((lcdReady || oledDisplay.reserved) && (command == "read" || command == "write" || command == "shiftin" || command == "shiftout"))
     {
         String pins = commandLine;
         int count = (command == "read" || command == "write") ? 1 : 3;
@@ -1840,7 +2170,7 @@ static void handleCommand(const String &line)
             int pin = toIntDef(nextToken(pins), -1);
             if (pin == 4 || pin == 5)
             {
-                commandOutput->println(F("ERROR: GPIO4/GPIO5 are reserved for LCD I2C"));
+                commandOutput->println(F("ERROR: GPIO4/GPIO5 are reserved for display I2C"));
                 return;
             }
         }
@@ -1872,6 +2202,7 @@ static void handleCommand(const String &line)
     }
     if (command == "reset")
     {
+        scriptRuntime.reset();
         for (int i = 0; i < 8; ++i)
         {
             stopJob(jobs[i]);
@@ -1996,6 +2327,12 @@ static void handleCommand(const String &line)
     commandOutput->println(F("'"));
 }
 
+static void handleCommand(const String &line, uint16_t sourceLine)
+{
+    ErrorOutputScope output(sourceLine);
+    executeCommand(line);
+}
+
 void setup()
 {
     Serial.begin(115200);
@@ -2041,31 +2378,44 @@ void loop()
     while (Serial.available())
     {
         char ch = Serial.read();
+        if (ch == '\n' && inputAfterCR) { inputAfterCR = false; continue; }
+        inputAfterCR = ch == '\r';
         if (ch == '\n' || ch == '\r')
         {
-            if (inputBuffer.length() > 0 && inputBraceDepth <= 0)
+            inputComment = false;
+            if (inputBuffer.length() > 0 && inputBraceDepth <= 0 && !trim(inputBuffer).endsWith("|"))
             {
                 handleCommand(inputBuffer);
                 inputBuffer = "";
                 inputBraceDepth = 0;
                 inputQuoted = inputEscaped = false;
+                inputQuoteChar = 0;
+                inputLine = 1;
             }
-            else if (inputBuffer.length() > 0) inputBuffer += ' ';
+            else if (inputBuffer.length() > 0) { inputBuffer += '\n'; ++inputLine; }
         }
         else
         {
-            if (inputQuoted && inputEscaped) inputEscaped = false;
+            if (inputComment) {} // Braces and quotes in comments are ordinary text.
+            else if (!inputQuoted && ch == '#' && (inputBuffer.length() == 0 ||
+                     isspace((unsigned char)inputBuffer[inputBuffer.length()-1]) ||
+                     inputBuffer.endsWith("{") || inputBuffer.endsWith(";") || inputBuffer.endsWith("|"))) inputComment = true;
+            else if (inputQuoted && inputEscaped) inputEscaped = false;
             else if (inputQuoted && ch == '\\') inputEscaped = true;
-            else if (ch == '"') inputQuoted = !inputQuoted;
+            else if (inputQuoted && ch == inputQuoteChar) { inputQuoted = false; inputQuoteChar = 0; }
+            else if (!inputQuoted && (ch == '"' || ch == '\'')) { inputQuoted = true; inputQuoteChar = ch; }
             else if (!inputQuoted && ch == '{') ++inputBraceDepth;
             else if (!inputQuoted && ch == '}') --inputBraceDepth;
             inputBuffer += ch;
             if (inputBuffer.length() > 4096)
             {
-                Serial.println(F("ERROR: command too long"));
+                Serial.print(F("ERROR: command too long at line "));
+                Serial.println(inputLine);
                 inputBuffer = "";
                 inputBraceDepth = 0;
                 inputQuoted = inputEscaped = false;
+                inputQuoteChar = 0; inputComment = false;
+                inputLine = 1;
             }
         }
     }
@@ -2081,5 +2431,10 @@ void loop()
     }
 
     serviceJobs();
+    scriptRuntime.tick((uint32_t)millis(), (uint32_t)micros());
+    std::string oledError;
+    if (!oledDisplay.service((uint32_t)millis(), oledError)) {
+        commandOutput->print(F("ERROR: ")); commandOutput->println(oledError.c_str());
+    }
     yield();
 }

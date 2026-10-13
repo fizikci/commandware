@@ -2,7 +2,11 @@
 
 This guide uses the current ESP8266 firmware. Commands go into the serial console
 at 115200 baud or the web console. Use ESP8266 GPIO numbers, not a board's `D`
-labels. Run each example separately unless it is a single schedule block.
+labels. Run each example separately unless it is a single schedule or `do` block.
+See [Commandware scripting](language.md) for initialization blocks, periodic
+sampling with `every`, named outputs, variables, functions, and sequential music
+playback. The complete [notes-and-blink program](examples/notes-and-blink.cw)
+plays two notes while an independent LED job runs.
 
 ## Connect to the board
 
@@ -377,6 +381,70 @@ echo 0 | PYTHONPATH=src python -m commandware not
 The first command returns a bounded clock sample rather than running forever.
 The second maps `5` to `50`; the third inverts `0` to `1`. Simulator timing is
 virtual and does not predict the board's electrical behavior.
+
+## Display text and charts on an OLED
+
+IIC is another label for I2C. This command supports SSD1306 and SH1106 modules
+with 128x64 or 128x32 screens; it does not automatically identify the controller.
+Wire SDA to GPIO4 and SCL to GPIO5, share ground, and power the module according
+to its specification. Keep the I2C pull-ups at 3.3 V for the ESP8266.
+
+Start with:
+
+```text
+oled init ssd1306
+oled print "Hello"
+oled print 2 16 "Commandware"
+```
+
+If the image is blank or shifted, try `oled init sh1106` and print again. An
+I2C communication error points to wiring/power/address rather than controller
+identification; a device acknowledging an address does not identify its model.
+Try `--address 0x3d` if your module uses that address. For a 128x32 screen, add
+`--height 32` to initialization. Both controller choices use the same drawing
+commands. Initialization clears previous text and charts.
+
+Coordinates default to `(0,0)`. These two forms place text at pixel `(2,2)`:
+
+```text
+oled print 2 2 "hello"
+oled print "hello" --x 2 --y 2
+```
+
+Text updates only its character cells. Use `oled clear` to erase everything,
+including traces, before drawing a new layout. Pipeline values work too:
+
+```text
+every 200 | adc A0 | oled print
+```
+
+Kill that job before starting another screen layout. For a voltage trace:
+
+```text
+do {
+    oled init ssd1306
+    oled print "A0 counts"
+    every 200 | adc A0 | oled chart --min 0 --max 1023 --y 8 --height 56
+}
+```
+
+Each reading advances the trace one pixel. Change the min/max values to match
+your units. You can put independent traces in separate rectangles; the
+[two-chart example](examples/oled-charts.cw) shows raw counts and percent from
+the same ADC reading, without requiring extra sensor hardware. It is a layout
+example, not a temperature/humidity driver.
+
+The screen refreshes in short transactions between device-loop iterations.
+`reset`/`kill` preserve the last screen; `oled clear` erases it. GPIO4/5 remain
+reserved for the display bus. Communication failures include a line number;
+after a failed transfer, fix the connection and run `oled init` again.
+
+The controller command implementations follow the
+[SSD1306 datasheet](https://www.olimex.com/Products/Modules/LCD/MOD-OLED-128x64/resources/SSD1306.pdf)
+and [SH1106 datasheet](https://community.nxp.com/pwmxy87654/attachments/pwmxy87654/kinetis/46518/1/SH1106%20datasheet.pdf).
+The bundled ASCII bitmap font is derived from
+[Adafruit GFX](https://github.com/adafruit/Adafruit-GFX-Library/blob/master/glcdfont.c);
+its BSD license is included beside the driver and simulator.
 
 ## Happy Birthday
 

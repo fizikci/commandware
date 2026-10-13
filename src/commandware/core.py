@@ -7,6 +7,7 @@ from math import ceil, exp, isfinite, log
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
+from .oled import OledDisplay
 
 
 def parse_pin(pin: object) -> int | str:
@@ -57,6 +58,7 @@ class Command:
 class ScheduleEntry:
     start_ms: int
     pipeline: str
+    line: int = field(default=1, compare=False)
 
 
 def _milliseconds(token: str, allow_zero: bool = False) -> int:
@@ -70,12 +72,21 @@ def parse_schedule(text: str) -> list[ScheduleEntry]:
     if not match:
         raise ValueError("schedule requires { START_MS { COMMAND } ... }")
     body = match[1]
+    source_offset = match.start(1)
     entries = []
     while body.strip():
         entry = re.match(r'\s*([0-9]+)\s*\{((?:"(?:\\.|[^"\\])*"|[^{}"])+)\}', body, re.S)
         if not entry or not entry[2].strip():
-            raise ValueError("invalid schedule entry")
-        entries.append(ScheduleEntry(_milliseconds(entry[1], True), entry[2].strip()))
+            offset = source_offset + len(body) - len(body.lstrip())
+            raise ValueError(f"invalid schedule entry at line {text.count(chr(10), 0, offset) + 1}")
+        command_offset = source_offset + entry.start(2) + len(entry[2]) - len(entry[2].lstrip())
+        try:
+            start_ms = _milliseconds(entry[1], True)
+        except ValueError as exc:
+            number = text.count("\n", 0, source_offset + entry.start(1)) + 1
+            raise ValueError(f"{exc} at line {number}") from exc
+        entries.append(ScheduleEntry(start_ms, entry[2].strip(), text.count("\n", 0, command_offset) + 1))
+        source_offset += entry.end()
         body = body[entry.end():]
     if not 1 <= len(entries) <= 32:
         raise ValueError("schedule requires 1..32 entries")
@@ -141,9 +152,15 @@ class HardwareState:
     lcd_lines: list[str] = field(default_factory=lambda: [" " * 16, " " * 16])
     lcd_history: list[list[str]] = field(default_factory=list)
     lcd_address: int = 0x27
+    lcd_ready: bool = False
+    oled: OledDisplay = field(default_factory=OledDisplay)
+    tone_history: list[tuple[int, int, float, int]] = field(default_factory=list)
+    script_writes: list[tuple[int, int, int]] = field(default_factory=list)
 
     def claim_pin(self, pin: object, job_id: int) -> None:
         pin_number = int(parse_pin(pin))
+        if self.oled.reserved and pin_number in (4, 5):
+            raise ValueError(f"GPIO{pin_number} is reserved for OLED I2C")
         owner = self.pin_owners.get(pin_number)
         if owner is not None and owner != job_id:
             raise ValueError(f"GPIO{pin_number} is owned by job {owner}")
@@ -185,7 +202,7 @@ class HardwareState:
                 available = "available"
                 rows.append(f"{label:<8} {available}")
             else:
-                status = "reserved" if pin in self.pin_owners else "available"
+                status = "OLED I2C" if self.oled.reserved and pin in (4, 5) else "reserved" if pin in self.pin_owners else "available"
                 rows.append(f"GPIO{pin:<2}  GPIO       {status}")
         return rows
 
@@ -474,7 +491,10 @@ def _lcd(args: list[str], hardware: HardwareState, values: Sequence[object]) -> 
         address = int(args[1], 0) if len(args) == 2 else 0x27
         if not 0x08 <= address <= 0x77:
             raise ValueError("invalid LCD I2C address")
+        if hardware.oled.reserved and hardware.oled.address == address:
+            raise ValueError("LCD address is already used by OLED")
         hardware.lcd_address = address
+        hardware.lcd_ready = True
         hardware.lcd_lines = [" " * 16, " " * 16]
         return []
     if action == "clear" and len(args) == 1:
@@ -488,6 +508,7 @@ def _lcd(args: list[str], hardware: HardwareState, values: Sequence[object]) -> 
     else:
         raise ValueError("invalid LCD command")
     for text in texts:
+        hardware.lcd_ready = True
         cells = [" "] * 32
         pos = 0
         for char in text:
@@ -500,6 +521,15 @@ def _lcd(args: list[str], hardware: HardwareState, values: Sequence[object]) -> 
                 pos += 1
         hardware.lcd_lines = ["".join(cells[:16]), "".join(cells[16:])]
         hardware.lcd_history.append(hardware.lcd_lines.copy())
+    return []
+
+
+def _oled(args, hardware, values):
+    if values:
+        for value in values:
+            hardware.oled.command(args, value, True, hardware)
+    else:
+        hardware.oled.command(args, hardware=hardware)
     return []
 
 
@@ -530,7 +560,8 @@ def _system_help(_args: list[str], _values: Sequence[object] | None = None, **_:
         "help", "pins", "jobs", "kill", "status", "reset", "run", "schedule",
         "read", "write", "adc", "ohm", "clock", "map", "not", "edge",
         "rising", "falling", "debounce", "toggle", "divide", "pulse",
-        "print", "lcd", "shiftin", "shiftout"
+        "print", "lcd", "oled", "shiftin", "shiftout", "do", "every", "var", "set",
+        "func", "call", "split", "each", "tone", "sleep"
     ]
 
 
@@ -539,7 +570,10 @@ def _system_pins(_args: list[str], _values: Sequence[object] | None = None, hard
     return hw.pins_snapshot()
 
 
-def _system_jobs(_args: list[str], _values: Sequence[object] | None = None, jobs: JobManager | None = None, **_: object) -> list[str]:
+def _system_jobs(_args: list[str], _values: Sequence[object] | None = None, jobs: JobManager | None = None, hardware: HardwareState | None = None, **_: object) -> list[str]:
+    runtime = getattr(hardware, "_script_runtime", None)
+    if jobs is None and runtime is not None:
+        jobs = runtime.jobs
     if jobs is None:
         return []
     return jobs.list_jobs()
@@ -551,16 +585,22 @@ def _system_status(_args: list[str], _values: Sequence[object] | None = None, **
 
 def _system_reset(_args: list[str], _values: Sequence[object] | None = None, hardware: HardwareState | None = None, **_: object) -> list[str]:
     hw = hardware or HardwareState()
+    runtime = getattr(hw, "_script_runtime", None)
+    if runtime is not None:
+        runtime.reset()
     hw.gpio.clear()
     hw.analog.clear()
     hw.pin_owners.clear()
     return ["reset"]
 
 
-def _system_kill(args: list[str], _values: Sequence[object] | None = None, jobs: JobManager | None = None, **_: object) -> list[str]:
+def _system_kill(args: list[str], _values: Sequence[object] | None = None, jobs: JobManager | None = None, hardware: HardwareState | None = None, **_: object) -> list[str]:
     if not args:
         return ["ERROR: kill requires job id"]
     job_id = int(args[0])
+    runtime = getattr(hardware, "_script_runtime", None)
+    if runtime is not None and runtime.kill(job_id):
+        return [f"killed {job_id}"]
     if jobs is None or not jobs.kill(job_id):
         return [f"ERROR: unknown job {job_id}"]
     return [f"killed {job_id}"]
@@ -572,12 +612,20 @@ def _system_run(args: list[str], _values: Sequence[object] | None = None, hardwa
     path = Path(args[0])
     if not path.exists():
         return [f"ERROR: file not found: {args[0]}"]
+    source = path.read_text(encoding="utf-8")
+    if re.search(r"(?im)^\s*(do|func|var|set|every|call|oled)\b", source):
+        return run_stream(source, hardware=hardware, jobs=jobs)
     output: list[object] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for number, line in enumerate(source.splitlines(), 1):
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
-        output.extend(run_stream(stripped, values=output, hardware=hardware, jobs=jobs))
+        try:
+            result = run_stream(stripped, values=output, hardware=hardware, jobs=jobs)
+        except ValueError as exc:
+            raise ValueError(re.sub(r" at line (\d+)$", lambda m: f" at line {number + int(m[1]) - 1}", str(exc))) from exc
+        output.extend(re.sub(r" at line (\d+)$", lambda m: f" at line {number + int(m[1]) - 1}", value)
+                      if isinstance(value, str) and value.startswith("ERROR:") else value for value in result)
     return output
 
 
@@ -598,6 +646,7 @@ COMMANDS: dict[str, Callable[..., list[object]]] = {
     "write": lambda args, values, hardware, jobs=None, job_id=None, count=None: _write(args, hardware, values, job_id),
     "print": lambda args, values, hardware, jobs=None, job_id=None, count=None: _print(values),
     "lcd": lambda args, values, hardware, jobs=None, job_id=None, count=None: _lcd(args, hardware, values),
+    "oled": lambda args, values, hardware, jobs=None, job_id=None, count=None: _oled(args, hardware, values),
     "shiftin": lambda args, values, hardware, jobs=None, job_id=None, count=None: _shiftin(args, hardware, values),
     "shiftout": lambda args, values, hardware, jobs=None, job_id=None, count=None: _shiftout(args, hardware, values),
     "help": _system_help,
@@ -618,6 +667,16 @@ def _dispatch(command: Command, values: Sequence[object], hardware: HardwareStat
 
 
 def _simulate_schedule(entries: list[ScheduleEntry], hardware: HardwareState, jobs: JobManager | None, count: int | None) -> list[object]:
+    from .script import located
+    error_line = [1]
+    try:
+        return _simulate_schedule_impl(entries, hardware, jobs, count, error_line)
+    except (ValueError, TypeError, OverflowError) as exc:
+        message = re.sub(r" at line (\d+)$", lambda m: f" at line {error_line[0] + int(m[1]) - 1}", str(exc))
+        raise ValueError(located(message, error_line[0])) from exc
+
+
+def _simulate_schedule_impl(entries, hardware, jobs, count, error_line):
     """Run concurrent jobs on a virtual microsecond timeline, without sleeping.
 
     Unlimited clocks retain the simulator's bounded sampling behavior (one
@@ -628,6 +687,7 @@ def _simulate_schedule(entries: list[ScheduleEntry], hardware: HardwareState, jo
     output = []
     allowed = set(COMMANDS) - {"run", "reset", "kill", "jobs"}
     for index, entry in enumerate(entries):
+        error_line[0] = entry.line
         commands = parse_pipeline(entry.pipeline)
         if not commands or any(c.name not in allowed for c in commands):
             raise ValueError("unsupported scheduled command")
@@ -637,9 +697,9 @@ def _simulate_schedule(entries: list[ScheduleEntry], hardware: HardwareState, jo
             frequency, duration, pin = _clock_options(commands[0].args)
             if duration is not None and entry.start_ms + duration > 2147483647:
                 raise ValueError("schedule deadline exceeds supported range")
-            if any(c.name not in {"map", "ohm", "not", "edge", "rising", "falling", "debounce", "toggle", "divide", "pulse", "write", "print", "lcd"} for c in commands[1:]):
+            if any(c.name not in {"map", "ohm", "not", "edge", "rising", "falling", "debounce", "toggle", "divide", "pulse", "write", "print", "lcd", "oled"} for c in commands[1:]):
                 raise ValueError("unsupported clock pipeline stage")
-            if pin is not None and not any(c.name in {"write", "print", "lcd"} for c in commands[1:]):
+            if pin is not None and not any(c.name in {"write", "print", "lcd", "oled"} for c in commands[1:]):
                 commands.append(Command("write", [str(pin)]))
             if len(commands) > 9:
                 raise ValueError("pipeline too long")
@@ -665,6 +725,7 @@ def _simulate_schedule(entries: list[ScheduleEntry], hardware: HardwareState, jo
     while events:
         time_us, kind, index, tick = heapq.heappop(events)
         entry, commands, duration, pins, interval, states = prepared[index]
+        error_line[0] = entry.line
         if kind == 0:
             for pin in pins:
                 hardware.set_gpio(pin, 0)
@@ -718,12 +779,28 @@ def _simulate_schedule(entries: list[ScheduleEntry], hardware: HardwareState, jo
     return output
 
 
-def run_stream(command: str, values: Sequence[object] | None = None, hardware: HardwareState | None = None, jobs: JobManager | None = None, count: int | None = None, job_id: int | None = None) -> list[object]:
+def _run_stream(command: str, values: Sequence[object] | None = None, hardware: HardwareState | None = None, jobs: JobManager | None = None, count: int | None = None, job_id: int | None = None) -> list[object]:
     hardware = hardware or HardwareState()
     if not command or not command.strip():
         return []
-    if re.match(r"\s*schedule\b", command, re.I):
+    if hardware.oled.reserved and "$" not in command:
+        for stage in parse_pipeline(command) if "\n" not in command and ";" not in command and "{" not in command else []:
+            pin_count = 1 if stage.name in {"read", "write"} else 3 if stage.name in {"shiftin", "shiftout"} else 0
+            if any(parse_pin(pin) in (4, 5) for pin in stage.args[:pin_count]):
+                raise ValueError("GPIO4/GPIO5 are reserved for OLED I2C")
+    if values is not None and re.match(r"\s*adc\s+A0\s+--watch\s*\|", command, re.I) and "$" not in command:
+        return Pipeline(parse_pipeline(command)).execute(values, hardware=hardware, jobs=jobs, job_id=job_id)
+    if re.match(r"\s*schedule\b", command, re.I) and "$" not in command:
         return _simulate_schedule(parse_schedule(command), hardware, jobs, count)
+    if (re.match(r"\s*(do|func|call|var|set|every|each|split|sleep|tone|oled)\b", command, re.I)
+            or "$" in command or "--out" in command or "\n" in command or ";" in command or command.lstrip().startswith("#")
+            or "|" in command and any(c.name in {"do", "func", "call", "var", "set", "every", "each", "split", "sleep", "tone", "oled"} for c in parse_pipeline(command))):
+        from .script import ScriptRuntime
+        runtime = getattr(hardware, "_script_runtime", None)
+        if runtime is None:
+            runtime = hardware._script_runtime = ScriptRuntime(hardware, jobs)
+        runtime.submit(command)
+        return runtime.run(count if count is not None else 1)
     commands = parse_pipeline(command)
     if commands and commands[0].name == "clock" and _clock_options(commands[0].args)[1] is not None:
         return _simulate_schedule([ScheduleEntry(0, command)], hardware, jobs, count)
@@ -737,3 +814,13 @@ def run_stream(command: str, values: Sequence[object] | None = None, hardware: H
     if handler is None:
         raise ValueError(f"Unsupported command: {name}")
     return handler(args, stream, hardware=hardware, jobs=jobs, job_id=job_id, count=count)
+
+
+def run_stream(command: str, values: Sequence[object] | None = None, hardware: HardwareState | None = None, jobs: JobManager | None = None, count: int | None = None, job_id: int | None = None) -> list[object]:
+    """Evaluate commands, preserving interpreter locations and locating legacy errors."""
+    from .script import located
+    try:
+        result = _run_stream(command, values, hardware, jobs, count, job_id)
+    except (ValueError, TypeError, OverflowError, OSError) as exc:
+        raise ValueError(located(str(exc), 1)) from exc
+    return [located(value, 1) if isinstance(value, str) and value.startswith("ERROR:") else value for value in result]

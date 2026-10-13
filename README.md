@@ -22,6 +22,8 @@ arduino-cli monitor -p COM3 --config baudrate=115200
 
 ## Documentation
 
+- [Scripting language](docs/language.md): variables, functions, sequential
+  iteration, periodic jobs, OLED text/charts, and working example programs.
 - [Tutorial](docs/tutorial.md): setup, explained commands, pipelines, scheduling,
   and a complete Happy Birthday melody.
 - [Product requirements](docs/PRD.md): project goals, command model, and design.

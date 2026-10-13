@@ -77,6 +77,28 @@ test('multiline schedule reaches the device as one command', async () => {
   assert.equal(calls, 1);
 });
 
+test('jobs view retains background failures with error text and no Kill button', async () => {
+  const children = [];
+  const j = {replaceChildren() {children.length = 0;}, append(child) {children.push(child);}};
+  const document = {
+    createElement(tag) {return {tag, children: [], append(child) {this.children.push(child);}};},
+    createTextNode(text) {return {text};}
+  };
+  let jobs = "3 FAILED  every 500: unknown name 'missing' at line 3\n4 RUNNING  every 100";
+  const context = vm.createContext({document, j, r: {}, busy: false, send: async () => jobs});
+  const refresh = sketch.slice(sketch.indexOf('async function refresh()'), sketch.indexOf('    a.onclick='));
+  vm.runInContext(refresh, context);
+  await context.refresh();
+  assert.equal(children.length, 2);
+  assert.match(children[0].children[0].text, /FAILED.*unknown name 'missing' at line 3/);
+  assert.equal(children[0].children.length, 1);
+  assert.equal(children[1].children[1].textContent, 'Kill');
+  jobs = ''; // reset clears the history on the device.
+  await context.refresh();
+  assert.equal(children.length, 0);
+  assert.equal(j.textContent, 'No jobs running.');
+});
+
 // Run with `node tests/web_request.test.cjs` (Node 16+).
 (async () => {
   for (const {name, run} of tests) {

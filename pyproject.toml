@@ -21,5 +21,8 @@ package-dir = {"" = "src"}
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+commandware = ["OLED-FONT-LICENSE.txt"]
+
 [tool.pytest.ini_options]
 pythonpath = ["src"]

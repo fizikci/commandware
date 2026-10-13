@@ -26,6 +26,7 @@ exe = BUILD / "scheduler-tests.exe"
 subprocess.run([
     str(compiler), "/nologo", "/EHsc", "/std:c++14", "/W3",
     f"/I{tools / 'include'}", f"/I{BUILD}",
+    f"/I{ROOT / 'firmware/esp12e_commandware'}",
     *(f"/I{kits / 'Include' / sdk / part}" for part in ("ucrt", "shared", "um")),
     str(ROOT / "tests/firmware_scheduler.cpp"), f"/Fe:{exe}", f"/Fo:{BUILD / 'scheduler-tests.obj'}",
     "/link", f"/LIBPATH:{tools / 'lib/x64'}",

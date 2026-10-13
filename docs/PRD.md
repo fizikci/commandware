@@ -430,6 +430,31 @@ wiring, supported backpack mapping, and quoting rules.
 
 ---
 
+### `oled`
+
+SSD1306 and SH1106 I2C graphical displays support text and scrolling charts:
+
+```text
+oled init sh1106
+oled print "Ready"
+oled print 2 2 "hello"
+oled print "hello" --x 2 --y 2
+every 200 | adc A0 | oled chart --min 0 --max 1023
+oled clear
+```
+
+Defaults: SSD1306, 128x64, address `0x3c`, SDA=GPIO4, SCL=GPIO5, and coordinates
+`(0,0)`. Initialization accepts `--height 32`, `--width 128`, and
+`--address 0x3d`. Text and chart values can be positional, `--value VALUE`, or
+piped. Explicit values override the pipe; display sinks preserve the event.
+
+Chart areas use `--x`, `--y`, `--width`, `--height`, `--min`, and `--max`.
+Up to four independent non-overlapping areas scroll one pixel per sample.
+See [OLED language details](language.md#oled-text-and-charts) and
+[wiring/tutorial](tutorial.md#display-text-and-charts-on-an-oled).
+
+---
+
 ### `shiftout`
 
 Serialize an integer to GPIO pins.
@@ -653,6 +678,12 @@ Later, Wi-Fi/Telnet/WebSocket/SSH-like interfaces can remove that restriction.
 
 Keep parsing deliberately simple.
 
+The implemented scripting extension is specified in [language.md](language.md):
+`do` blocks, `every`, local variables, structured events and named outputs,
+functions, sequential list iteration, and cooperative finite commands. The
+grammar below describes the original scalar pipeline subset. This extension
+remains deliberately smaller than a Bash-style shell.
+
 Conceptually:
 
 ```text
@@ -681,7 +712,9 @@ Do **not** implement a full Bash-style shell.
 
 The LCD command adds double-quoted text with `\n`, `\"`, and `\\` escapes.
 Pipeline separators and schedule braces inside those strings are literal text.
-No redirection, environment variables, or subshells are implemented.
+No redirection, operating-system environment variables, or subshells are
+implemented. `$name` in the scripting extension refers to Commandware variables
+or current-event fields.
 
 ---
 
