@@ -297,7 +297,16 @@ SDA is GPIO4 and SCL is GPIO5. Once initialized, those pins remain reserved,
 including after `kill` or `reset`; display contents also remain visible. An LCD
 and OLED can share those pins if their addresses differ. OLED initialization
 rejects existing GPIO owners, output pulses, and queued jobs using the bus pins.
-Communication failures include the drawing command's line. A transfer failure
+Communication failures include the command's source line, I2C return code,
+and address: code 1 is a full transmit buffer,
+2 is an address acknowledgement failure, 3 is a data acknowledgement failure,
+and 4 is a busy bus on ESP8266. The bus runs at 100 kHz for both OLED and LCD.
+Initialization retries the complete controller setup once after 25 ms if the
+display does not acknowledge its address (code 2). This applies to explicit
+`oled init` and automatic first-use initialization. A successful retry lets
+the same script continue; a second failure reports the error and stops the
+affected script. Other errors and display refresh transfers are not retried.
+A transfer failure
 pauses refresh until `oled init` succeeds; subsequent drawing commands fail,
 stopping their affected background jobs.
 

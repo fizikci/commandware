@@ -90,13 +90,13 @@ test('jobs view retains background failures with error text and no Kill button',
   vm.runInContext(refresh, context);
   await context.refresh();
   assert.equal(children.length, 2);
-  assert.match(children[0].children[0].text, /FAILED.*unknown name 'missing' at line 3/);
+  assert.match(children[0].children[0].text, /FAILED \(history\).*unknown name 'missing' at line 3/);
   assert.equal(children[0].children.length, 1);
   assert.equal(children[1].children[1].textContent, 'Kill');
   jobs = ''; // reset clears the history on the device.
   await context.refresh();
   assert.equal(children.length, 0);
-  assert.equal(j.textContent, 'No jobs running.');
+  assert.equal(j.textContent, 'No active jobs or recorded failures.');
 });
 
 // Run with `node tests/web_request.test.cjs` (Node 16+).

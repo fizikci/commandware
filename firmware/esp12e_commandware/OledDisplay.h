@@ -21,11 +21,19 @@ class OledDisplay {
     uint16_t transferLine = 1;
     uint32_t powerReadyAt = 0;
     bool displayOn = false, faulted = false;
+    int lastPacketStatus = 0;
 
     bool packet(uint8_t control, const uint8_t *data, size_t count, std::string &error) {
-        if (send && send(address, control, data, count)) return true;
+        const int status = lastPacketStatus = send ? send(address, control, data, count) : -1;
+        if (status == 0) return true;
         ready = false; faulted = true; dirty = 0; page = -1;
-        error = "oled: I2C communication failed; check wiring/address and run oled init";
+        const char *reason = status == 1 ? "transmit buffer full" :
+            status == 2 ? "address not acknowledged" : status == 3 ? "data not acknowledged" :
+            status == 4 ? "bus busy" : status == -1 ? "transport unavailable" : "bus error";
+        const char *hex = "0123456789abcdef";
+        error = "oled: I2C communication failed (code " + std::to_string(status) + ": " + reason +
+            ", address 0x" + std::string(1, hex[address >> 4]) + std::string(1, hex[address & 15]) +
+            "); check wiring/address and run oled init";
         return false;
     }
     static bool numeric(const Value &value, double &result) {
@@ -36,7 +44,8 @@ class OledDisplay {
         } else return false;
         return std::isfinite(result);
     }
-    bool initialize(bool sh, int newHeight, int newAddress, uint16_t line, uint32_t now, std::string &error) {
+    bool initializeOnce(bool sh, int newHeight, int newAddress, uint16_t line, uint32_t now, std::string &error) {
+        lastPacketStatus = 0;
         if (begin && !begin(newAddress, error)) return false;
         ready = false;
         address = (uint8_t)newAddress; height = newHeight; sh1106 = sh;
@@ -54,6 +63,15 @@ class OledDisplay {
         dirty = (uint8_t)((1 << (height/8))-1); lines.fill(line);
         return true;
     }
+    bool initialize(bool sh, int newHeight, int newAddress, uint16_t line, uint32_t now, std::string &error) {
+        if (initializeOnce(sh, newHeight, newAddress, line, now, error)) return true;
+        if (lastPacketStatus != 2) return false;
+        // A display may miss the first address acknowledgement. Retry the
+        // entire initialization once; drawing and GPIO commands are not replayed.
+        delay(25);
+        error.clear();
+        return initializeOnce(sh, newHeight, newAddress, line, now + 25, error);
+    }
     void pixel(int x, int y, bool on, uint16_t line) {
         if (x < 0 || x >= 128 || y < 0 || y >= height) return;
         int index = (y/8)*128+x; uint8_t bit = (uint8_t)(1 << (y%8));
@@ -70,7 +88,8 @@ public:
     uint8_t address = 0x3c;
     std::array<uint8_t, 1024> buffer = {};
     std::function<bool(int, std::string &)> begin;
-    std::function<bool(uint8_t, uint8_t, const uint8_t *, size_t)> send;
+    // Wire status: zero means success; nonzero retains the hardware error code.
+    std::function<int(uint8_t, uint8_t, const uint8_t *, size_t)> send;
 
     bool busy() const { return ready && (dirty || page >= 0 || !displayOn); }
     // At most one <=32-byte I2C transaction per call. Redirtying a page during

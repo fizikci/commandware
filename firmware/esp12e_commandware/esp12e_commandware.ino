@@ -56,69 +56,332 @@ static const char WEB_PAGE[] PROGMEM = R"rawliteral(
   <meta charset="utf-8">
   <title>Commandware</title>
   <style>
-    :root { color-scheme: dark; font: 16px/1.5 system-ui, sans-serif; background: #0b1120; color: #e5edf8; }
+    :root { color-scheme: dark; font: 14px/1.5 system-ui, sans-serif; background: #0b1120; color: #e5edf8; }
     * { box-sizing: border-box; }
-    body { max-width: 32rem; min-height: 100vh; margin: 0 auto; padding: max(1.5rem, env(safe-area-inset-top)) 1rem max(2rem, env(safe-area-inset-bottom)); }
-    h1 { margin: 0; font-size: 1.8rem; letter-spacing: -.04em; }
-    h2 { margin: 0 0 1rem; font-size: 1.1rem; }
-    header { margin-bottom: 1.5rem; }
-    header p { margin: .2rem 0 0; color: #93a4bc; font-size: .9rem; }
-    section { margin-top: 1rem; padding: 1rem; border: 1px solid #26344a; border-radius: 1rem; background: #111b2d; }
-    label { display: block; margin: .9rem 0 .35rem; color: #aebed3; font-size: .82rem; font-weight: 650; }
-    textarea, button { min-height: 3rem; border: 1px solid #34445d; border-radius: .7rem; font: inherit; }
-    textarea { resize: vertical; min-height: 6rem; padding-top: .65rem; width: 100%; padding: 0 .8rem; background: #0b1424; color: #edf4ff; }
-    #command-form { margin-top: .9rem; }
-    .command-row { display: flex; align-items: stretch; gap: .55rem; }
-    .command-entry { position: relative; min-width: 0; flex: 1; }
-    #command { padding-right: 3rem; }
-    #command-action { position: absolute; top: .25rem; right: .25rem; width: 2.5rem; min-height: 2.5rem; padding: 0; border: 0; background: transparent; color: #93a4bc; font-size: 1.25rem; }
-    #command-action:active { background: #26344a; }
-    .suggestions { position: absolute; z-index: 2; top: calc(100% + .35rem); right: 0; left: 0; max-height: 14rem; overflow-y: auto; padding: .3rem; border: 1px solid #34445d; border-radius: .7rem; background: #111b2d; box-shadow: 0 .7rem 1.5rem #0008; }
-    .suggestions[hidden] { display: none; }
-    .suggestions button { display: block; width: 100%; min-height: 2.7rem; padding: .45rem .6rem; border: 0; border-radius: .45rem; background: transparent; color: #dbeafe; text-align: left; font-size: .9rem; overflow-wrap: anywhere; }
-    .suggestions button:active, .suggestions button:focus { background: #26344a; }
-    button { padding: 0 .95rem; background: #2563eb; border-color: #3b82f6; color: white; font-weight: 700; cursor: pointer; touch-action: manipulation; }
-    button:active { background: #1d4ed8; }
+    body { margin: 0; height: 100vh; height: 100dvh; display: flex; flex-direction: column; overflow: hidden; }
+    header { flex: none; display: flex; align-items: baseline; gap: 1rem; padding: .7rem 1rem; border-bottom: 1px solid #26344a; }
+    h1 { margin: 0; font-size: 1.25rem; letter-spacing: -.04em; }
+    header p { margin: 0; color: #93a4bc; font-size: .85rem; }
+    h2 { margin: 0; font-size: .95rem; }
+    main { position: relative; display: grid; grid-template-columns: 20% 55% 25%; flex: 1; min-height: 0; }
+    .panel { display: flex; flex-direction: column; min-width: 0; min-height: 0; background: #111b2d; }
+    .panel + .panel { border-left: 1px solid #26344a; }
+    .toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: .5rem; min-height: 3.5rem; flex: none; padding: .65rem .85rem; border-bottom: 1px solid #26344a; }
+    .toolbar h2, .toolbar label { margin-right: auto; font-weight: 650; }
+    .scroll { flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; padding: .75rem; }
+    button, input { border: 1px solid #34445d; border-radius: .35rem; font: inherit; }
+    button { padding: .35rem .7rem; background: #2563eb; border-color: #3b82f6; color: white; font-weight: 650; cursor: pointer; touch-action: manipulation; }
+    button:hover { background: #1d4ed8; }
     button:disabled { opacity: .55; cursor: wait; }
-    pre { min-height: 4rem; margin: .8rem 0 0; padding: .85rem; overflow-wrap: anywhere; white-space: pre-wrap; border: 1px solid #26344a; border-radius: .7rem; background: #080e19; color: #c6d5e8; font: .88rem/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; }
-    #jobs-list { display: grid; gap: .6rem; margin: 0; padding: 0; list-style: none; }
-    #jobs-list li { display: flex; align-items: center; justify-content: space-between; gap: .6rem; min-width: 0; padding: .7rem; border: 1px solid #26344a; border-radius: .7rem; background: #0b1424; color: #c6d5e8; font-size: .88rem; overflow-wrap: anywhere; }
-    #jobs-list button { min-height: 2.4rem; flex: 0 0 auto; padding: 0 .7rem; border-color: #7f3441; background: #451923; color: #fecdd3; font-size: .82rem; }
-    #jobs-list button:active { background: #672331; }
-    @media (max-width: 360px) { body { padding-right: .75rem; padding-left: .75rem; } section { padding: .8rem; } .command-row { gap: .4rem; } .command-row > button { padding: 0 .7rem; } }
+    button:focus-visible, input:focus-visible, textarea:focus-visible, .divider:focus-visible { outline: 2px solid #93c5fd; outline-offset: -2px; }
+    .secondary { background: #172338; border-color: #34445d; color: #c6d5e8; }
+    #sample-filter { width: 100%; min-width: 0; padding: .5rem; background: #0b1424; color: #edf4ff; }
+    .filter { flex: none; padding: .75rem .75rem 0; }
+    #command-suggestions { display: grid; align-content: start; gap: .4rem; }
+    #command-suggestions button { width: 100%; text-align: left; white-space: pre-wrap; overflow-wrap: anywhere; padding: .65rem; font: .85rem/1.5 ui-monospace, Consolas, monospace; background: #0b1424; border-color: #26344a; color: #c6d5e8; }
+    #command-suggestions button:hover { background: #1b2e4a; border-color: #5683bd; }
+    #command-suggestions h3 { display: inline; margin: 0; font-size: .8rem; color: #93a4bc; text-transform: uppercase; letter-spacing: .05em; }
+    .sample-group summary { padding: .6rem .35rem; cursor: pointer; color: #93a4bc; border-bottom: 1px solid #26344a; }
+    .sample-group summary:hover { background: #1b2e4a; }
+    .sample-group summary:focus-visible { outline: 2px solid #93c5fd; }
+    .sample-items { display: grid; gap: .4rem; padding-top: .4rem; }
+    #command-suggestions strong, #command-suggestions small, #command-suggestions code { display: block; }
+    #command-suggestions strong { font: 650 .88rem/1.4 system-ui, sans-serif; color: #edf4ff; }
+    #command-suggestions small { margin: .3rem 0; font: .8rem/1.45 system-ui, sans-serif; color: #93a4bc; }
+    #command-suggestions code { color: #93c5fd; }
+    .sample-hint { margin: .4rem 0 0; color: #93a4bc; font-size: .8rem; }
+    #command-form { margin: 0; }
+    .editor-host { flex: 1; min-height: 0; min-width: 0; position: relative; overflow: hidden; background: #0b1424; }
+    #command { display: block; width: 100%; height: 100%; margin: 0; padding: 1rem; resize: none; border: 0; border-radius: 0; background: #0b1424; color: #edf4ff; font: 14px/1.6 ui-monospace, Consolas, monospace; tab-size: 2; overflow: auto; }
+    .editor-host .CodeMirror { height: 100%; background: #0b1424; color: #edf4ff; font: 14px/1.6 ui-monospace, Consolas, monospace; }
+    .editor-host .CodeMirror-gutters { background: #101a2b; border-color: #26344a; }
+    .editor-host .CodeMirror-linenumber { color: #73849d; }
+    .editor-host .CodeMirror-cursor { border-left-color: #edf4ff; }
+    .editor-host .CodeMirror-selected { background: #294369; }
+    .editor-host .cm-keyword { color: #93c5fd; }
+    .editor-host .cm-number { color: #fbbf24; }
+    .editor-host .cm-string { color: #86efac; }
+    .editor-host .cm-comment { color: #8495ad; }
+    .editor-host .cm-variable-2 { color: #c4b5fd; }
+    .editor-host .cm-operator { color: #f9a8d4; }
+    .editor-status { padding: .35rem .85rem; border-top: 1px solid #26344a; color: #93a4bc; font-size: .8rem; }
+    .script-bar { display: flex; flex-wrap: wrap; gap: .5rem 1rem; padding: .35rem .85rem; border-bottom: 1px solid #26344a; font-size: .8rem; }
+    #script-title { overflow-wrap: anywhere; }
+    #file-message { color: #93a4bc; }
+    dialog { width: min(30rem, calc(100vw - 2rem)); max-height: 80vh; overflow: auto; padding: 1.25rem; border: 1px solid #34445d; border-radius: .7rem; background: #111b2d; color: #edf4ff; }
+    dialog::backdrop { background: #0009; }
+    dialog h2 { margin-bottom: .75rem; }
+    dialog input { display: block; width: 100%; margin: .5rem 0 1rem; padding: .6rem; background: #0b1424; color: #edf4ff; }
+    .dialog-actions { display: flex; justify-content: flex-end; gap: .5rem; margin-top: 1rem; }
+    #saved-scripts { display: grid; gap: .5rem; }
+    #saved-scripts button { text-align: left; overflow-wrap: anywhere; }
+    #result { margin: 0 0 1rem; white-space: pre-wrap; overflow-wrap: anywhere; color: #c6d5e8; font: .9rem/1.6 ui-monospace, Consolas, monospace; }
+    #jobs-heading { border-top: 1px solid #26344a; padding-top: .75rem; margin-bottom: .6rem; }
+    #jobs-list { display: grid; gap: .5rem; margin: 0; padding: 0; list-style: none; }
+    #jobs-list li { display: flex; align-items: center; justify-content: space-between; gap: .5rem; padding: .6rem; border: 1px solid #26344a; border-radius: .35rem; background: #0b1424; color: #c6d5e8; font-size: .85rem; overflow-wrap: anywhere; }
+    #jobs-list button { flex: none; background: #451923; border-color: #7f3441; color: #fecdd3; font-size: .8rem; }
+    .divider { position: absolute; top: 0; bottom: 0; width: 8px; transform: translateX(-50%); cursor: col-resize; touch-action: none; z-index: 5; }
+    .divider:hover, .divider:focus-visible { background: #5683bd88; }
+    #divider-left { left: 20%; } #divider-right { left: 75%; }
+    @media (max-width: 600px) {
+      header { gap: .5rem; padding: .5rem; } header p { display: none; }
+      .toolbar { padding: .5rem; gap: .3rem; } .toolbar button { padding: .3rem; font-size: .8rem; }
+      .filter, .scroll { padding: .4rem; } .editor-status { padding: .35rem; }
+    }
   </style>
 </head>
 <body>
   <header><h1>Commandware</h1><p>Change your ESP8266 behavior with commands</p></header>
-  <main>
-    <section aria-label="Command console">
-      <form id="command-form">
-        <div class="command-row">
-          <div class="command-entry">
-            <textarea rows="3" id="command" name="command" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="e.g. read 4" required aria-autocomplete="list" aria-controls="command-suggestions" aria-expanded="false"></textarea>
-            <button id="command-action" type="button" aria-label="Show command suggestions" aria-expanded="false">▾</button>
-            <div id="command-suggestions" class="suggestions" role="listbox" hidden></div>
-          </div>
-          <button type="submit">Run</button>
-        </div>
-      </form>
-      <pre id="result" aria-live="polite">Choose a command or enter one above.</pre>
+  <main id="workspace">
+    <section class="panel" aria-labelledby="samples-heading">
+      <div class="toolbar"><h2 id="samples-heading">Command samples</h2></div>
+      <div class="filter"><input id="sample-filter" type="search" placeholder="Filter samples..." aria-label="Filter command samples"><p class="sample-hint">Click to insert at the cursor.</p></div>
+      <div id="command-suggestions" class="scroll" aria-label="Command samples"></div>
     </section>
-    <section aria-labelledby="jobs-heading">
-      <h2 id="jobs-heading">Running jobs</h2>
-      <ul id="jobs-list"><li>Loading...</li></ul>
+    <form id="command-form" class="panel" aria-label="Command editor">
+      <div class="toolbar"><label for="command">Editor</label><button id="new-script" class="secondary" type="button">New</button><button id="open-script" class="secondary" type="button">Open</button><button id="save-script" class="secondary" type="button">Save</button><button id="run-command" type="submit" title="Run (Ctrl+Enter or Cmd+Enter)">Run</button></div>
+      <div class="script-bar"><span id="script-title">Untitled</span><span id="file-message" role="status" aria-live="polite"></span></div>
+      <div class="editor-host"><textarea id="command" name="command" autocomplete="off" autocapitalize="off" spellcheck="false" wrap="off" aria-label="Command editor" placeholder="Choose a sample or write commands here."></textarea></div>
+      <div class="editor-status"><span id="editor-status" role="status">Basic editor · loading enhancements...</span> · Ctrl/Cmd+Enter to run</div>
+    </form>
+    <section class="panel" aria-labelledby="output-heading">
+      <div class="toolbar"><h2 id="output-heading">Output</h2><button id="clear-output" class="secondary" type="button">Clear</button></div>
+      <div class="scroll"><pre id="result" aria-live="polite">Choose a sample or write a command, then Run.</pre><h2 id="jobs-heading">Jobs and failure history</h2><p class="sample-hint">Failed entries are retained until reset, even after a later run succeeds.</p><ul id="jobs-list"><li>Loading...</li></ul></div>
     </section>
+    <div id="divider-left" class="divider" role="separator" tabindex="0" aria-label="Resize samples and editor" aria-orientation="vertical" aria-valuemin="10" aria-valuemax="60" aria-valuenow="20"></div>
+    <div id="divider-right" class="divider" role="separator" tabindex="0" aria-label="Resize editor and output" aria-orientation="vertical" aria-valuemin="35" aria-valuemax="90" aria-valuenow="75"></div>
   </main>
+  <dialog id="save-dialog" aria-labelledby="save-heading">
+    <form id="save-form">
+      <h2 id="save-heading">Save script</h2>
+      <label for="script-name">Script name</label><input id="script-name" maxlength="80" required autocomplete="off" placeholder="e.g. OLED sensor chart">
+      <p>Saved in this browser for this device address.</p>
+      <p id="save-error" role="alert"></p>
+      <div class="dialog-actions"><button id="cancel-save" class="secondary" type="button">Cancel</button><button type="submit">Save script</button></div>
+    </form>
+  </dialog>
+  <dialog id="open-dialog" aria-labelledby="open-heading">
+    <h2 id="open-heading">Open saved script</h2>
+    <div id="saved-scripts"></div>
+    <div class="dialog-actions"><button id="cancel-open" class="secondary" type="button">Cancel</button></div>
+  </dialog>
   <script>
-    const f=document.getElementById('command-form'),i=document.getElementById('command'),r=document.getElementById('result'),d=document.getElementById('command-suggestions'),a=document.getElementById('command-action'),j=document.getElementById('jobs-list'),p=['help','write 4 1','write 4 0','write 4 1 100','read 4','read 5','read 12','adc A0','ohm A0','status','clock 500 | write 5','clock 1000 --dur 500 | write 15','schedule { 1000 { clock 1000 --dur 500 | write 15 } 1500 { clock 1400 --dur 1000 | write 15 } }'];let h=[],busy=false;
-    function suggestions(){const all=[...h,...p.filter(c=>!h.includes(c))],query=i.value.trim().toLowerCase(),matches=query?all.filter(c=>c.toLowerCase().includes(query)):all;d.replaceChildren(...matches.map(c=>{const b=document.createElement('button');b.type='button';b.textContent=c;b.setAttribute('role','option');b.onclick=()=>{i.value=c;closeSuggestions();i.focus()};return b}));if(!matches.length){const empty=document.createElement('div');empty.textContent='No matching commands';empty.style.cssText='padding:.5rem;color:#93a4bc;font-size:.85rem';d.append(empty)}}
-    function openSuggestions(){suggestions();d.hidden=false;a.textContent=i.value?'×':'▾';a.setAttribute('aria-label',i.value?'Clear command':'Show command suggestions');a.setAttribute('aria-expanded','true');i.setAttribute('aria-expanded','true')}
-    function closeSuggestions(){d.hidden=true;a.textContent=i.value?'×':'▾';a.setAttribute('aria-label',i.value?'Clear command':'Show command suggestions');a.setAttribute('aria-expanded','false');i.setAttribute('aria-expanded','false')}
-    function remember(c){h=[c,...h.filter(x=>x!==c)].slice(0,12);if(!d.hidden)suggestions()}
+    const f=document.getElementById('command-form'),i=document.getElementById('command'),r=document.getElementById('result'),d=document.getElementById('command-suggestions'),a=document.getElementById('new-script'),j=document.getElementById('jobs-list'),filter=document.getElementById('sample-filter'),run=document.getElementById('run-command'),status=document.getElementById('editor-status');
+    const p=[
+      {group:'Device and jobs',items:[
+        ['Command reference','List supported commands and options.','help'],
+        ['Device status','Inspect the board and active outputs.','status'],
+        ['Pin availability','Check GPIO ownership before connecting a display or starting a job.','pins'],
+        ['List jobs','Inspect running jobs, queued commands, and script failures.','jobs'],
+        ['Stop one job','Replace 1 with the job ID shown in the output column.','kill 1'],
+        ['Stop all jobs','Stop background work and clear queued commands; the display image remains.','reset']
+      ]},
+      {group:'OLED setup',items:['ssd1306','sh1106'].flatMap(controller=>[64,32].flatMap(height=>['0x3c','0x3d'].map(address=>[
+        `${controller.toUpperCase()} 128×${height} · ${address}`,
+        'SDA=GPIO4, SCL=GPIO5. Choose your controller, height, and I2C address. Initialization clears the screen.',
+        `oled init ${controller} --width 128 --height ${height} --address ${address}`
+      ])))},
+      {group:'OLED text',items:[
+        ['Hello OLED','Print at the top left. Uses current setup, or SSD1306 128×64 at 0x3c by default.','oled print "Hello, Commandware!"'],
+        ['Positioned text','Place text at pixel x=2, y=16 using positional coordinates.','oled print 2 16 "Ready"'],
+        ['Named coordinates','Place text using --x and --y options.','oled print "Ready" --x 2 --y 16'],
+        ['Two lines of text','Clear old content and draw two rows. Works with 32- and 64-pixel displays.','do {\n  oled clear\n  oled print "Commandware"\n  oled print 0 8 "Ready to run"\n}'],
+        ['ADC reading on OLED','Read A0 once and print its raw count on the second row.','adc A0 | oled print 0 8'],
+        ['Live ADC text','Update every 200 ms. Stop its job in the output column; uses current OLED setup.','do {\n  oled clear\n  oled print "A0 counts"\n  every 200 | adc A0 | oled print 0 8\n}'],
+        ['Clear OLED','Erase the display and chart histories; running jobs can draw again.','oled clear']
+      ]},
+      {group:'OLED charts',items:[
+        ['Live ADC chart · 64px','Raw A0 counts, 200 ms per sample. Requires a 128×64 display; uses current controller/address.','do {\n  oled clear\n  oled print "A0 counts"\n  every 200 | adc A0 | oled chart --min 0 --max 1023 --y 8 --height 56\n}'],
+        ['Live ADC chart · 32px','Compact trace for a 128×32 display. Initialize the correct height first.','do {\n  oled clear\n  oled print "A0 counts"\n  every 200 | adc A0 | oled chart --min 0 --max 1023 --y 8 --height 24\n}'],
+        ['Live percentage chart','Map A0 counts to 0–100%. Requires a 128×64 display; uses current OLED setup.','do {\n  oled clear\n  oled print "A0 percent"\n  every 200 | adc A0 | map 0 1023 0 100 | oled chart --min 0 --max 100 --y 8 --height 56\n}'],
+        ['Two charts from one reading','Raw counts and percent in separate areas on a 128×64 display. Stop old display jobs first.','do {\n  oled clear\n  oled print "Raw A0"\n  oled print 0 32 "Percent A0"\n  every 200 |\n    adc A0 --out raw |\n    map 0 1023 0 100 --out percent |\n    oled chart $raw --min 0 --max 1023 --y 8 --height 24 |\n    oled chart $percent --min 0 --max 100 --y 40 --height 24\n}']
+      ]},
+      {group:'GPIO and sensors',items:[
+        ['Read GPIO12','Read a digital input; GPIO numbers are used, not board D labels.','read 12'],
+        ['Set GPIO12 high','Drive a connected output high. Leaves GPIO4/5 free for I2C.','write 12 1'],
+        ['Set GPIO12 low','Drive a connected output low.','write 12 0'],
+        ['100 ms output pulse','Drive GPIO12 high briefly, then return it low.','write 12 1 100'],
+        ['Blink every 500 ms','Toggle GPIO12 in a background job. Stop it with the Kill button.','every 500 | toggle | write 12'],
+        ['Read analog input','Read the raw A0 count, from 0 to 1023.','adc A0'],
+        ['Analog percentage','Convert one A0 reading to a 0–100% value.','adc A0 | map 0 1023 0 100'],
+        ['Resistance measurement','Uses the calibrated resistor-divider circuit described in the tutorial.','ohm A0']
+      ]},
+      {group:'Scripts and sound',items:[
+        ['Variables and arithmetic','Declare a value, change it, and print the result.','do {\n  var count 10\n  set count $count + 5\n  print $count\n}'],
+        ['Reusable function','Define and call a function with a text parameter.','func greet name {\n  print "Hello $name"\n}\n\ndo {\n  call greet "Commandware"\n}'],
+        ['Two-note melody','Play C4 then E4 on a buzzer connected to GPIO15.','do {\n  tone 15 --hz 262 --dur 200\n  sleep 100\n  tone 15 --hz 330 --dur 300\n}'],
+        ['Timed clock output','Generate 1 kHz on GPIO15 for 500 ms.','clock 1000 --dur 500 | write 15'],
+        ['Schedule two notes','Start timed GPIO15 clock jobs 1 s and 1.5 s after submission.','schedule {\n  1000 { clock 1000 --dur 500 | write 15 }\n  1500 { clock 1400 --dur 1000 | write 15 }\n}']
+      ]}
+    ];
+    let busy=false,editor=null,executing=false,currentName=null,savedValue='';
+    const storageKey='commandware.scripts.v1',scriptTitle=document.getElementById('script-title'),fileMessage=document.getElementById('file-message'),saveDialog=document.getElementById('save-dialog'),openDialog=document.getElementById('open-dialog'),scriptName=document.getElementById('script-name');
+    function editorValue(){return editor?editor.getValue():i.value}
+    function updateScriptState(){const dirty=editorValue()!==savedValue;scriptTitle.textContent=(currentName||'Untitled')+(dirty?' · Unsaved changes':'');if(dirty)fileMessage.textContent=''}
+    function setEditorValue(value){if(editor){editor.setValue(value);editor.clearHistory();editor.focus()}else{i.value=value;i.setSelectionRange(0,0);i.focus()}updateScriptState()}
+    function discardChanges(){return editorValue()===savedValue||confirm('Discard unsaved changes to '+(currentName||'Untitled')+'?')}
+    function readScripts(){
+      const raw=localStorage.getItem(storageKey);
+      if(raw===null)return [];
+      const scripts=JSON.parse(raw);
+      if(!Array.isArray(scripts)||scripts.some(s=>!s||typeof s.name!=='string'||!s.name.trim()||typeof s.source!=='string')||new Set(scripts.map(s=>s.name)).size!==scripts.length)throw Error('Invalid saved scripts');
+      return scripts;
+    }
+    function saveScript(name){
+      name=name.trim();
+      const fail=message=>{fileMessage.textContent=message;document.getElementById('save-error').textContent=message;return false};
+      if(!name||name.length>80)return fail('Enter a script name of 1–80 characters.');
+      try{
+        const scripts=readScripts(),existing=scripts.findIndex(s=>s.name===name),source=editorValue();
+        if(existing!==-1&&name!==currentName&&!confirm('Replace saved script "'+name+'"?'))return false;
+        if(existing===-1)scripts.push({name,source});else scripts[existing]={name,source};
+        localStorage.setItem(storageKey,JSON.stringify(scripts));
+        currentName=name;savedValue=source;updateScriptState();fileMessage.textContent='Saved in this browser.';return true;
+      }catch(e){return fail('Unable to save. Browser storage may be unavailable, full, or contain invalid saved data. Your editor text is unchanged.')}
+    }
+    function openScripts(){
+      const list=document.getElementById('saved-scripts');list.replaceChildren();
+      try{
+        const scripts=readScripts().sort((a,b)=>a.name.localeCompare(b.name));
+        if(!scripts.length)list.textContent='No saved scripts yet. Use Save to name and store a script.';
+        for(const script of scripts){
+          const button=document.createElement('button');button.type='button';button.className='secondary';button.textContent=script.name;
+          button.onclick=()=>{if(!discardChanges())return;currentName=script.name;savedValue=script.source;openDialog.close();setEditorValue(script.source);fileMessage.textContent='Opened from this browser.'};list.append(button);
+        }
+        openDialog.showModal();
+      }catch(e){fileMessage.textContent='Unable to read saved scripts. Browser storage is unavailable or contains invalid data.'}
+    }
+    function insertSample(value){
+      const content=editorValue(),cursor=editor?editor.indexFromPos(editor.getCursor('head')):i.selectionEnd;
+      // Keep complete commands separate without deleting even a selected range.
+      const text=(cursor>0&&content[cursor-1]!=='\n'?'\n':'')+value+(cursor<content.length&&content[cursor]!=='\n'?'\n':'');
+      if(editor){const position=editor.posFromIndex(cursor);editor.replaceRange(text,position,position,'+input');editor.setCursor(editor.posFromIndex(cursor+text.length));editor.focus()}
+      else{i.setRangeText(text,cursor,cursor,'end');i.focus()}
+      updateScriptState();
+    }
+    const expandedGroups=new Set();
+    function suggestions(){
+      const query=filter.value.trim().toLowerCase();
+      d.replaceChildren();
+      for(const group of p){
+        const matches=group.items.filter(item=>[group.group,...item].join(' ').toLowerCase().includes(query));
+        if(!matches.length)continue;
+        const section=document.createElement('details'),summary=document.createElement('summary'),heading=document.createElement('h3'),items=document.createElement('div');
+        section.className='sample-group';section.open=Boolean(query)||expandedGroups.has(group.group);
+        heading.textContent=group.group;summary.append(heading);items.className='sample-items';
+        summary.onclick=e=>{e.preventDefault();section.open=!section.open;if(!query){if(section.open)expandedGroups.add(group.group);else expandedGroups.delete(group.group)}};
+        section.append(summary,items);d.append(section);
+        for(const [title,description,code] of matches){
+          const b=document.createElement('button'),name=document.createElement('strong'),detail=document.createElement('small'),preview=document.createElement('code');
+          b.type='button';b.title='Insert at cursor';b.setAttribute('aria-label','Insert '+title);
+          name.textContent=title;detail.textContent=description;
+          const lines=code.split('\n');preview.textContent=lines[0]+(lines.length>1?` … (${lines.length} lines)`:'');
+          b.append(name,detail,preview);b.onclick=()=>insertSample(code);items.append(b);
+        }
+      }
+      if(!d.children.length)d.textContent='No matching commands.';
+      d.scrollTop=0;
+    }
     let requestQueue=Promise.resolve();
     function send(c){const request=requestQueue.then(async()=>{const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),10000);try{const x=await fetch('/api/command',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({command:c}),signal:controller.signal}),t=await x.text();if(!x.ok)throw Error(t||x.statusText);return t}catch(e){if(e.name==='AbortError')throw Error('Request timed out. Check device connection; command may have executed.');throw e}finally{clearTimeout(timer)}});requestQueue=request.catch(()=>{});return request}
-    async function refresh(){if(busy)return;busy=true;try{const t=await send('jobs'),a=t.split(/\r?\n/).map(s=>s.match(/^(\d+)\s+(RUNNING|FAILED)\s+(.*)$/)).filter(Boolean);j.replaceChildren();if(!a.length){j.textContent='No jobs running.';return}a.forEach(m=>{const li=document.createElement('li'),b=document.createElement('button');li.append(document.createTextNode(`#${m[1]} ${m[2]} ${m[3]} `));b.textContent='Kill';b.onclick=async()=>{b.disabled=true;try{r.textContent=await send(`kill ${m[1]}`);await refresh()}catch(e){r.textContent=`Request failed: ${e}`;b.disabled=false}};if(m[2]==='RUNNING')li.append(b);j.append(li)})}catch(e){j.textContent=`Unable to load jobs: ${e}`}finally{busy=false}}
-    a.onclick=()=>{if(i.value)i.value='';openSuggestions();i.focus()};i.onfocus=()=>openSuggestions();i.oninput=()=>openSuggestions();document.addEventListener('click',e=>{if(!e.target.closest('.command-entry'))closeSuggestions()});document.addEventListener('keydown',e=>{if(e.key==='Escape')closeSuggestions()});f.onsubmit=async e=>{e.preventDefault();const c=i.value.trim();r.textContent='Running...';closeSuggestions();try{r.textContent=await send(c);remember(c);await refresh()}catch(x){r.textContent=`Request failed: ${x}`}};closeSuggestions();refresh();setInterval(refresh,3000);
+    async function refresh(){
+      if(busy)return;busy=true;
+      try{
+        const text=await send('jobs'),entries=text.split(/\r?\n/).map(s=>s.match(/^(\d+)\s+(RUNNING|FAILED)\s+(.*)$/)).filter(Boolean);
+        j.replaceChildren();
+        if(!entries.length){j.textContent='No active jobs or recorded failures.';return}
+        entries.forEach(m=>{
+          const li=document.createElement('li');
+          li.append(document.createTextNode(`#${m[1]} ${m[2]==='FAILED'?'FAILED (history)':'RUNNING'} ${m[3]} `));
+          if(m[2]==='RUNNING'){
+            const b=document.createElement('button');b.textContent='Kill';
+            b.onclick=async()=>{b.disabled=true;try{r.textContent=await send(`kill ${m[1]}`);await refresh()}catch(e){r.textContent=`Request failed: ${e}`;b.disabled=false}};
+            li.append(b);
+          }
+          j.append(li);
+        });
+      }catch(e){j.textContent=`Unable to load jobs: ${e}`}finally{busy=false}
+    }
+    a.onclick=()=>{if(!discardChanges())return;currentName=null;savedValue='';setEditorValue('');fileMessage.textContent=''};
+    document.getElementById('open-script').onclick=openScripts;
+    document.getElementById('save-script').onclick=()=>{if(currentName!==null){saveScript(currentName);return}scriptName.value='';document.getElementById('save-error').textContent='';saveDialog.showModal();scriptName.focus()};
+    document.getElementById('save-form').onsubmit=e=>{e.preventDefault();if(saveScript(scriptName.value))saveDialog.close()};
+    document.getElementById('cancel-save').onclick=()=>saveDialog.close();
+    document.getElementById('cancel-open').onclick=()=>openDialog.close();
+    i.addEventListener('input',updateScriptState);
+    filter.oninput=suggestions;
+    document.getElementById('clear-output').onclick=()=>{r.textContent=''};
+    f.onsubmit=async e=>{
+      e.preventDefault();
+      const c=editorValue().trim();
+      if(!c||executing)return;
+      executing=true;run.disabled=true;r.textContent='Running...';
+      try{r.textContent=await send(c);await refresh()}
+      catch(x){r.textContent=`Request failed: ${x}`}
+      finally{executing=false;run.disabled=false}
+    };
+    f.addEventListener('keydown',e=>{
+      if((e.ctrlKey||e.metaKey)&&e.key==='Enter'){e.preventDefault();f.requestSubmit()}
+      if(!editor&&e.target===i&&e.key==='Tab'){e.preventDefault();i.setRangeText('  ',i.selectionStart,i.selectionEnd,'end');updateScriptState()}
+    });
+    const workspace=document.getElementById('workspace'),left=document.getElementById('divider-left'),right=document.getElementById('divider-right');
+    let sizes=[20,55,25];
+    function resizePanels(handle,position){
+      let boundary;
+      if(handle===left){boundary=Math.max(10,Math.min(100-sizes[2]-25,position));sizes=[boundary,100-sizes[2]-boundary,sizes[2]]}
+      else{boundary=Math.max(sizes[0]+25,Math.min(90,position));sizes=[sizes[0],boundary-sizes[0],100-boundary]}
+      workspace.style.gridTemplateColumns=sizes.map(n=>n+'%').join(' ');
+      left.style.left=sizes[0]+'%';right.style.left=(100-sizes[2])+'%';
+      left.setAttribute('aria-valuenow',Math.round(sizes[0]));left.setAttribute('aria-valuemax',Math.round(100-sizes[2]-25));
+      right.setAttribute('aria-valuenow',Math.round(100-sizes[2]));right.setAttribute('aria-valuemin',Math.round(sizes[0]+25));
+      if(editor)editor.refresh();
+    }
+    [left,right].forEach(handle=>{
+      handle.onpointerdown=e=>{
+        if(e.button!==0)return;
+        e.preventDefault();handle.setPointerCapture(e.pointerId);
+        handle.onpointermove=event=>{const rect=workspace.getBoundingClientRect();resizePanels(handle,(event.clientX-rect.left)/rect.width*100)};
+      };
+      handle.onpointerup=handle.onpointercancel=handle.onlostpointercapture=()=>{handle.onpointermove=null};
+      handle.onkeydown=e=>{if(e.key==='ArrowLeft'||e.key==='ArrowRight'){e.preventDefault();resizePanels(handle,(handle===left?sizes[0]:100-sizes[2])+(e.key==='ArrowLeft'?-2:2))}};
+    });
+    async function loadEditor(){
+      const base='https://cdn.jsdelivr.net/npm/codemirror@5.65.21/lib/';
+      let script,css,timer;
+      try{
+        await new Promise((resolve,reject)=>{
+          timer=setTimeout(()=>reject(Error('CDN timeout')),6000);
+          css=document.createElement('link');css.rel='stylesheet';css.href=base+'codemirror.css';
+          script=document.createElement('script');script.src=base+'codemirror.js';script.async=true;
+          let loaded=0;const ready=()=>{if(++loaded===2)resolve()};
+          css.onload=script.onload=ready;css.onerror=script.onerror=()=>reject(Error('CDN unavailable'));
+          document.head.append(css,script);
+        });
+        CodeMirror.defineMode('commandware',()=>({
+          token(stream){
+            if(stream.eatSpace())return null;
+            if(stream.match(/^#.*/))return 'comment';
+            if(stream.match(/^"(?:[^"\\]|\\.)*"|^'(?:[^'\\]|\\.)*'/))return 'string';
+            if(stream.match(/^\$[\w]+/))return 'variable-2';
+            if(stream.match(/^\b\d+(?:\.\d+)?\b/))return 'number';
+            if(stream.match(/^(?:--[\w-]+|[|{}()+*/%!-])/))return 'operator';
+            if(stream.match(/^[a-zA-Z_]\w*/))return 'keyword';
+            stream.next();return null;
+          }
+        }));
+        const cursor=i.selectionEnd;
+        editor=CodeMirror.fromTextArea(i,{lineNumbers:true,mode:'commandware',theme:'commandware',indentUnit:2,tabSize:2,lineWrapping:false,viewportMargin:10,extraKeys:{'Ctrl-Enter':()=>f.requestSubmit(),'Cmd-Enter':()=>f.requestSubmit(),Tab:cm=>cm.somethingSelected()?cm.indentSelection('add'):cm.replaceSelection('  ')}});
+        editor.setCursor(editor.posFromIndex(cursor));
+        editor.on('change',updateScriptState);
+        editor.getInputField().setAttribute('aria-label','Command editor');
+        status.textContent='CodeMirror editor';
+      }catch(e){
+        if(editor){editor.toTextArea();editor=null}
+        if(script)script.remove();if(css)css.remove();
+        status.textContent='Basic editor · CDN unavailable';
+      }finally{clearTimeout(timer)}
+    }
+    suggestions();refresh();setInterval(refresh,3000);loadEditor();
   </script>
 </body>
 </html>
@@ -1968,13 +2231,14 @@ static void configureScriptRuntime()
         if (pendingWritePulse.active && (pendingWritePulse.pin == 4 || pendingWritePulse.pin == 5))
             { error = "oled: I2C pins are used by a pulse"; return false; }
         Wire.begin(4, 5);
-        Wire.setClock(lcdReady ? 100000 : 400000);
+        Wire.setClock(100000);
         return true;
     };
     oledDisplay.send = [](uint8_t address, uint8_t control, const uint8_t *bytes, size_t count) {
-        Wire.beginTransmission(address); Wire.write(control);
-        for (size_t i = 0; i < count; ++i) if (Wire.write(bytes[i]) != 1) { Wire.endTransmission(); return false; }
-        return Wire.endTransmission() == 0;
+        Wire.beginTransmission(address);
+        if (Wire.write(control) != 1) { Wire.endTransmission(); return 1; }
+        for (size_t i = 0; i < count; ++i) if (Wire.write(bytes[i]) != 1) { Wire.endTransmission(); return 1; }
+        return (int)Wire.endTransmission();
     };
     scriptRuntime.background = [](const std::string &text) {
         ErrorOutputScope output(scriptRuntime.executingLine);

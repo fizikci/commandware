@@ -66,19 +66,23 @@ void digitalWrite(int pin, int value) { gpio[pin] = value; writes.emplace_back(p
 int digitalRead(int pin) { return gpio[pin]; }
 static int adcValue = 512;
 int analogRead(int) { return adcValue; }
-void delay(unsigned long) {}
+static std::vector<unsigned long> delays;
+void delay(unsigned long ms) { delays.push_back(ms); }
 void delayMicroseconds(unsigned int) {}
 struct FakeWire {
     int error = 0;
-    int sda = -1, scl = -1, address = 0;
+    int sda = -1, scl = -1, address = 0, clock = 0;
+    bool writeFails = false;
+    std::vector<int> responses;
+    size_t responseIndex = 0;
     std::vector<uint8_t> bytes;
     std::vector<std::vector<uint8_t>> packets;
     std::vector<uint8_t> transaction;
     void begin(int a, int b) { sda = a; scl = b; }
-    void setClock(int) {}
+    void setClock(int frequency) { clock = frequency; }
     void beginTransmission(int a) { address = a; transaction.clear(); }
-    size_t write(uint8_t value) { bytes.push_back(value); transaction.push_back(value); return 1; }
-    int endTransmission() { packets.push_back(transaction); return error; }
+    size_t write(uint8_t value) { if (writeFails) return 0; bytes.push_back(value); transaction.push_back(value); return 1; }
+    int endTransmission() { packets.push_back(transaction); return responseIndex < responses.size() ? responses[responseIndex++] : error; }
 } Wire;
 struct { int getFreeHeap() { return 10000; } } ESP;
 struct { int status() { return 3; } String localIP() { return "127.0.0.1"; } } WiFi;
@@ -97,7 +101,7 @@ void fresh(uint64_t timeUs = 0) {
     for (auto &entry : scheduled) entry = ScheduledCommand();
     nextJobId = 1;
     fakeUs = timeUs;
-    gpio.clear(); writes.clear();
+    gpio.clear(); writes.clear(); delays.clear();
     Serial.output.str(""); Serial.output.clear();
     pendingWritePulse = PendingWritePulse();
     Serial.input.clear(); Serial.position = 0;
@@ -488,6 +492,7 @@ int main(int argc, char **argv) {
     for (const char *controller : {"ssd1306", "sh1106"}) {
         fresh(); handleCommand((std::string("oled init ")+controller).c_str());
         assert(oledDisplay.ready && oledDisplay.reserved && Wire.sda == 4 && Wire.scl == 5);
+        assert(Wire.clock == 100000);
         bool sh = std::string(controller) == "sh1106";
         assert(oledDisplay.sh1106 == sh && Wire.packets.size() == 2);
         assert(Wire.packets[1][1] == (sh ? 0xad : 0x20));
@@ -567,9 +572,51 @@ int main(int argc, char **argv) {
     }
     fresh(); Wire.error = 2; handleCommand("do {\n oled init\n}");
     assert(!oledDisplay.ready && !oledDisplay.reserved && Serial.output.str().find("at line 2") != std::string::npos);
+    assert(Serial.output.str().find("code 2: address not acknowledged, address 0x3c") != std::string::npos);
+    assert(Wire.packets.size() == 2 && delays == std::vector<unsigned long>({25}));
+    fresh(); Wire.error = 3; handleCommand("oled init --address 0x3d");
+    assert(Serial.output.str().find("code 3: data not acknowledged, address 0x3d") != std::string::npos);
+    assert(Wire.packets.size() == 1 && delays.empty());
+    fresh(); Wire.error = 4; handleCommand("oled init");
+    assert(Serial.output.str().find("code 4: bus busy") != std::string::npos);
+    assert(Wire.packets.size() == 1 && delays.empty());
+    fresh(); Wire.writeFails = true; handleCommand("oled init");
+    assert(Serial.output.str().find("code 1: transmit buffer full") != std::string::npos);
+    fresh();
+    const char *twoLines = "do {\n oled init ssd1306\n oled clear\n oled print \"Commandware\"\n oled print 0 8 \"Ready to run\"\n}";
+    Wire.error = 2; handleCommand(twoLines); at(0);
+    assert(scriptRuntime.failures.size() == 1 && !oledDisplay.ready);
+    Wire.error = 0; handleCommand(twoLines); at(0);
+    assert(oledDisplay.ready && scriptRuntime.tasks.empty() && scriptRuntime.failures.size() == 1);
+    assert(oledDisplay.buffer[0] == oledFontByte(('C'-32)*5));
+    assert(oledDisplay.buffer[128] == oledFontByte(('R'-32)*5));
+    while(oledDisplay.busy()) { std::string error; assert(oledDisplay.service(100, error)); }
+    assert(scriptRuntime.failures[0].message.find("code 2: address not acknowledged") != std::string::npos);
+    fresh(); Wire.responses = {2, 0, 0}; handleCommand("oled init ssd1306");
+    assert(oledDisplay.ready && Wire.packets.size() == 3 && delays == std::vector<unsigned long>({25}));
+    assert(scriptRuntime.failures.empty() && Serial.output.str().find("ERROR") == std::string::npos);
+    fresh(); Wire.responses = {2, 0, 0}; handleCommand(twoLines); at(0);
+    assert(oledDisplay.ready && scriptRuntime.failures.empty() && scriptRuntime.tasks.empty());
+    assert(oledDisplay.buffer[0] == oledFontByte(('C'-32)*5));
+    assert(oledDisplay.buffer[128] == oledFontByte(('R'-32)*5));
+    assert(Wire.packets.size() == 3 && delays == std::vector<unsigned long>({25}));
+    // An acknowledgement failure in the second packet restarts the whole
+    // sequence and preserves the requested controller, address, and dimensions.
+    fresh(); Wire.responses = {0, 2, 0, 0}; handleCommand("oled init sh1106 --address 0x3d --height 32");
+    assert(oledDisplay.ready && oledDisplay.sh1106 && oledDisplay.height == 32 && oledDisplay.address == 0x3d);
+    assert(Wire.packets.size() == 4 && Wire.packets[0] == Wire.packets[2] && Wire.packets[1] == Wire.packets[3]);
+    assert(delays == std::vector<unsigned long>({25}) && Serial.output.str().find("ERROR") == std::string::npos);
+    fresh(); Wire.responses = {2, 2, 0}; handleCommand(twoLines); at(0);
+    assert(!oledDisplay.ready && Wire.packets.size() == 2 && scriptRuntime.failures.size() == 1);
+    assert(std::all_of(oledDisplay.buffer.begin(), oledDisplay.buffer.end(), [](uint8_t v) { return v == 0; }));
+    assert(delays == std::vector<unsigned long>({25}));
+    // Automatic initialization used by the first drawing command also recovers.
+    fresh(); Wire.responses = {2, 0, 0}; handleCommand("oled print \"Hello\"");
+    assert(oledDisplay.ready && scriptRuntime.failures.empty() && Wire.packets.size() == 3);
     fresh(); handleCommand("do {\n oled print \"Hello\"\n}");
     Wire.error = 2; std::string transferError;
     assert(!oledDisplay.service(100, transferError) && transferError.find("at line 2") != std::string::npos);
+    assert(transferError.find("code 2: address not acknowledged") != std::string::npos);
     assert(!oledDisplay.ready && oledDisplay.reserved);
     handleCommand("oled print \"retry\""); assert(!oledDisplay.ready);
     Wire.error = 0; handleCommand("oled init"); assert(oledDisplay.ready);
