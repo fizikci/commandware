@@ -34,8 +34,9 @@ adc A0 |
 ```
 
 Braces enclose command bodies. A comment starts with `#` at a token boundary and
-continues to the newline. Command names are case-insensitive; variable, parameter,
-field, and function names are case-sensitive.
+continues to the newline. Built-in command and value-function names are
+case-insensitive; variable, parameter, field, and user-defined function names
+are case-sensitive.
 
 Names use letters, digits, and underscores, start with a letter or underscore,
 and cannot be `value`. A declaration or binding uses the bare name; reading it
@@ -167,34 +168,121 @@ convert string operands, including when both are strings. List comparisons are e
 "20" + 1             # 21
 5 == "5"             # 1
 "20" > 5             # 1
-"hello" > 5          # 0: numeric comparison of 1 > 5
+"hello" > 5          # Error: invalid numeric text
 "hello" == "world"   # 0: textual comparison
 "20" + "5"          # 25
 "20" > "5"          # 1: numeric ordering
 "05" == "5"         # 0: different text
-number("05") == number("5")  # 1: equal numbers
+(number "05") == (number "5")  # 1: equal numbers
 ```
 
 Conditions and logical operators convert strings to numbers using the same
-conversion rules: zero is false and any other number is true. Thus `""`, `"   "`,
-and `"0"` are false, while `"hello"` is true. Lists are invalid conditions.
+conversion rules: zero is false and any other number is true. Thus `"0"` is
+false and `"2"` is true; `""`, `"   "`, and `"hello"` are errors. There is no
+separate permissive text-truthiness rule. Lists are invalid conditions.
 Comparisons and logical operators produce `0` or `1`. Logical operators
 short-circuit, so `$divisor != 0 && ($total / $divisor) > 10` is valid even when
 the divisor is zero.
 
-Built-in expression functions:
+### Function invocation syntax
 
-| Function | Contract |
+Functions use space-separated arguments, whether built-in or user-defined.
+Arguments are either all positional or all named; mixing the two forms is an
+error. Named arguments use `--PARAMETER VALUE`, match the parameter names exactly,
+and may appear in any order. Unknown, duplicate, missing, or extra arguments are
+errors. `--out` is an output binding, not a function parameter.
+
+```text
+max 5 10
+max --a 5 --b 10
+max 5 (min 10 20)
+max --a 5 --b (min --a 10 --b 20)
+set limit (max 5 10)
+write 12 $value > (max $low $high)
+max ($reading + 5) ($threshold * 2)
+```
+
+Nested value-function invocations need no parentheses. Each function has a fixed,
+known parameter signature and consumes exactly its own arguments recursively.
+A bare function name starts an invocation; variables always require `$name`.
+Parentheses can delimit a complete invocation or group ordinary expressions.
+There is no comma-separated `max(5, 10)` syntax or `call` prefix.
+
+```text
+max 5 min 10 3             # max receives 5 and the result of min 10 3.
+max --a 5 --b min --a 10 --b 3
+set limit max 5 min 10 3
+max 5 min 10 3 + 2         # min receives 10 and (3 + 2).
+max 5 ((min 10 3) + 2)     # max receives 5 and ((min 10 3) + 2).
+```
+
+Binary operators continue the current argument as described in section 2;
+the parser never reinterprets an expression to satisfy an argument count.
+Thus `max 5 -1` is missing an argument, while `max 5 (-1)` is valid.
+Named arguments belong to the innermost unfinished invocation. Each invocation
+must consume its full parameter set before parsing resumes in its caller.
+Function signatures are collected before executable statements are parsed and
+validated, including signatures of definitions later in the same submission.
+
+Only pure built-in value functions may appear inside expressions. They do not
+modify globals, events, hardware, or job state and cannot wait or spawn jobs.
+As stages, they replace the primary value with their result, preserve incoming
+fields and timestamp, and support a final `--out` binding. All listed parameters
+are required explicitly; functions do not implicitly take an argument from the
+incoming event. Use `$value` to select it. Nested calls cannot use `--out`.
+
+```text
+int "200.9" | print
+adc A0 | clamp $value 0 700 --out limited | print
+```
+
+### Built-in value-function catalog
+
+Lowercase words in the signatures below are parameter names, including their
+named-argument spelling. These are intended functions; implementations may lag
+behind this reference. Numeric parameters use strict numeric conversion. Text
+and list parameters require their stated kinds; lists never convert implicitly
+to text or numbers. All numeric results must be finite.
+
+| Function signature | Contract |
 | --- | --- |
-| `int(x)` | Convert a string using the rules below, then truncate toward zero; truncate numeric input toward zero |
-| `number(x)` | Convert a string using the rules below; accept a number unchanged |
-| `notehz(x)` | Convert a note string such as `C4`, `F#4`, or `Bb3` to Hz |
+| `number x` | Convert numeric text using the rules below; accept a number unchanged |
+| `int x` | Convert to a number, then truncate toward zero |
+| `string x` | Preserve a string or format a number using the round-trip formatting rule; reject lists |
+| `abs x` | Absolute value |
+| `min a b` | Smaller numeric value |
+| `max a b` | Larger numeric value |
+| `clamp x low high` | Restrict a number to the inclusive range; reject `low > high` |
+| `round x` | Nearest integer; exact halfway behavior remains to be specified |
+| `floor x` | Round toward negative infinity |
+| `ceil x` | Round toward positive infinity |
+| `len x` | String length or list item count |
+| `contains x item` | Substring test for strings, membership test for lists; return `0` or `1` |
+| `trim text` | Remove surrounding whitespace |
+| `lower text` | Convert letters to lowercase |
+| `upper text` | Convert letters to uppercase |
+| `slice x start end` | Return a string or list range; zero-based start, exclusive end |
+| `replace text old new` | Replace all non-overlapping occurrences of `old` with `new` |
+| `at items index` | Return a list item using a zero-based integer index |
+| `join items separator` | Join a list of strings into text; reject non-string items |
+| `notehz text` | Convert a note string such as `C4`, `F#4`, or `Bb3` to Hz |
+
+Indexes and range endpoints must be integers. Negative indexes, out-of-range
+indexes, and invalid ranges are errors. A slice requires
+`0 <= start <= end <= (len x)`; equal endpoints produce an empty result.
+List operations return new values and never mutate their inputs. `split` remains
+a pipeline command that produces lists; this catalog adds no list literals,
+mutation, sorting, or general-purpose collection framework.
+
+Before implementing the affected functions, specify text encoding and the units
+used by string length/slicing, case conversion and whitespace rules, halfway
+rounding, list-membership equality, and empty search-text behavior for `contains`
+and `replace`. These open details must have identical contracts on both runtimes.
 
 String-to-number conversion follows these rules:
 
 - Numeric text converts to its numeric value.
-- An empty or whitespace-only string converts to `0`.
-- Other nonnumeric text converts to `1`, rather than raising a conversion error.
+- Empty, whitespace-only, and other nonnumeric text raise a conversion error.
 
 Numeric text accepts surrounding whitespace, an optional sign, and the same
 decimal or hexadecimal forms as numeric literals. The entire trimmed string must
@@ -202,20 +290,20 @@ match to be treated as numeric text; conversion does not accept just a numeric
 prefix. Nonfinite numeric results remain errors.
 
 ```text
-int("200.9")   # 200
-int("hello")   # 1
-int("")        # 0
-int("   ")     # 0
-int("20O")     # 1: nonnumeric text, not 20
+(int "200.9")   # 200
+(int "hello")   # Error: invalid numeric text
+(int "")        # Error: invalid numeric text
+(int "   ")     # Error: invalid numeric text
+(int "20O")     # Error: invalid numeric text, not 20 or 1
 ```
 
-Implicit conversion uses the numeric value without truncation; `int()` explicitly
+Implicit conversion uses the numeric value without truncation; `int` explicitly
 truncates toward zero. Hardware commands validate their own ranges and integer
 requirements rather than silently truncating arguments.
 
 There are no list literals, indexing operators, implicit string concatenation,
 or user-defined expression functions in this core. Interpolation composes text;
-`call` invokes user-defined command functions.
+User-defined command functions are invoked directly by name.
 
 ## 4. Events and pipes
 
@@ -241,7 +329,7 @@ in the simulator. Timestamp metadata has no expression accessor in this draft.
 | Filter: `where` | Preserve or emit nothing | Preserve if emitted |
 | Sequential block: `do` | Result of body | Result of body |
 | Branch: `if` | Result of selected branch | Result of selected branch |
-| Function: `call` | Result of body | Result of body |
+| User-defined function invocation | Result of body | Result of body |
 
 The action rule means an explicit argument selects what is acted upon without
 changing the event flowing onward:
@@ -277,7 +365,7 @@ split ":" "C4:200" --out pitch,duration
 ```
 
 `--out` is the final option, before any body. Result-producing commands and
-`call` support it; actions and control commands do not. `each` uses `--out` to
+user-defined function invocations support it; actions and control commands do not. `each` uses `--out` to
 bind the current item.
 
 ## 5. Global variables and local parameters
@@ -314,6 +402,15 @@ or require a copy of the global table. Variables set inside a function are
 still global. A parameter name must not collide with a global variable or an
 incoming event field; ambiguous references are errors, not implicit shadowing.
 Event fields belong to events, not the global variable table.
+
+Collision checks apply in both directions. `set` rejects a target name that is
+an incoming event field or a parameter of the current invocation, before changing
+the global table. Parameters are read-only bindings; `set` never assigns to them.
+For example, `adc A0 --out raw | set raw 10` fails without creating a global.
+Checks use the current execution context, not a registry of all live fields and
+parameters. Another job can therefore create a global that collides with a
+suspended invocation's parameter or event field. A later reference to that name
+fails as ambiguous; it never silently changes lookup priority.
 
 All jobs share global variables and run cooperatively. One expression evaluation and
 assignment completes before another job advances; a sequence spanning a wait
@@ -397,6 +494,19 @@ do {
 
 Starting a background source or a schedule registers independent work and then
 continues the block. Future child events are not inserted into later statements.
+Successful registration emits no immediate event. If registration is the final
+statement, the block has no immediate output, even though its work completes.
+
+```text
+do {
+    every 100 | adc A0
+} | print "Registered"  # Does not run: registration emits no immediate event.
+
+do {
+    every 100 | adc A0
+    print "Registered"  # Runs as the next statement after registration.
+}
+```
 
 A filter suppresses downstream stages in its own pipeline only. It does not skip
 later statements in a `do`, branch, function, or `each` body. A standalone `where`
@@ -471,12 +581,21 @@ func pair text {
     split ":" $text
 }
 
-call pair "C4:200" --out pitch,duration |
-    tone 15 --hz notehz($pitch) --dur int($duration)
+pair "C4:200" --out pitch,duration |
+    tone 15 --hz (notehz $pitch) --dur (int $duration)
 ```
 
-Functions have named positional parameters and a sequential body. Arguments are
-evaluated once at call entry and their count must match the parameter count.
+Functions have declared parameters and a sequential body. Invoke a function
+directly by its case-sensitive name, using positional or named arguments under
+section 3's invocation rules. The `call` keyword is removed.
+
+```text
+pair --text "C4:200" --out pitch,duration
+```
+
+Arguments are evaluated once at call entry and must match the declared parameters.
+User-defined functions are command functions and may be pipeline stages, but
+cannot appear inside expressions: their bodies may wait or act on hardware.
 Calls receive the incoming event and create local parameter bindings only.
 They read and update the shared global variable table; no globals are copied.
 
@@ -487,8 +606,14 @@ inside a statement does not skip later statements. Parameter bindings disappear
 when the invocation is no longer needed.
 Global variable updates persist, and output fields continue to the caller.
 
-Definitions are registered before a submission executes and persist between
-submissions. Redefinition applies to calls that begin afterward. A suspended call
+Function definitions are allowed only as standalone top-level statements, never
+inside a body or a pipeline. Duplicate function names within one submission are
+errors. User-defined function names must not collide with built-in commands or
+value functions, ignoring case. Definitions are committed together only after the entire submission
+passes validation, before any executable statements run, and persist between
+submissions. Failed validation leaves existing definitions unchanged. A later
+runtime failure does not undo committed definitions.
+Redefinition applies to calls that begin afterward. A suspended call
 continues the definition it began with. Retaining active definitions must be
 bounded by an implementation limit; replacement must fail clearly if it would
 exceed that limit.
@@ -497,6 +622,25 @@ Sources started inside a function retain access to that invocation's parameter
 bindings for as long as needed, without copying global variables. The call
 finishes after its finite statements; it does not wait for independent child
 sources to end.
+
+### Stateful stage lifetime
+
+Each stateful stage occurrence, such as `toggle`, `edge`, `divide`, `debounce`,
+or `pulse`, has independent state. Direct stages in a job retain their state
+between events until that job ends. Separate jobs never share stage state merely
+because they execute the same source text.
+
+Each function invocation creates independent state for its body stages. Repeated
+calls initialize new state; nested or concurrent calls do not share it. A source
+created inside a function owns its downstream stage state for the child job's
+lifetime, even after the invocation that registered it has finished. Commands
+must document their initial state and transitions separately.
+
+```text
+func flip { toggle }
+every 100 | flip | print  # Each call starts a fresh toggle state.
+every 100 | toggle | print     # This toggle retains state between timer events.
+```
 
 ## 9. Lists and sequential iteration
 
@@ -536,8 +680,14 @@ integer. Its first event is emitted when first serviced; each event has primary
 value `0` and fresh fields. It accesses global variables at execution time,
 not a snapshot. It does not inherit fields from the registration event.
 
-Each source processes one event at a time, including downstream waits. Overdue
-ticks are skipped instead of queued without bound. Timer intervals are best-effort
+Each source processes one event at a time, including downstream waits. Periodic
+deadlines follow a fixed timeline anchored at source registration, rather than
+restarting the interval after downstream processing. When ready for another event,
+a source discards overdue ticks and waits for the next future deadline; a tick
+due exactly when the source becomes ready may run. There is no catch-up burst.
+The first-service event of `every` is the explicit exception to overdue skipping;
+later deadlines remain anchored at registration.
+Timer intervals are best-effort
 service intervals, not guarantees about physical edge timing or sample delivery.
 
 `clock` and `adc --watch` use the same events, expressions, and downstream grammar
@@ -547,6 +697,9 @@ pipe. When a background source receives an upstream event, it starts a new
 independent job for that event. The new job generates its own events for the
 remaining downstream stages; it does not block the upstream source until the
 new job ends.
+Registration emits no immediate event into the upstream job. Only the new job's
+future events execute the captured downstream stages. Source arguments are
+evaluated once at registration; downstream expressions read globals when reached.
 
 ```text
 every 100 | clock 10 | write 12
@@ -580,8 +733,8 @@ do {
     schedule {
         $offset { tone 15 --hz 440 --dur 100 }
         300 {
-            call pair "C4:200" --out pitch,duration |
-                tone 15 --hz notehz($pitch) --dur int($duration)
+            pair "C4:200" --out pitch,duration |
+                tone 15 --hz (notehz $pitch) --dur (int $duration)
         }
     }
     print "Registered"
@@ -594,7 +747,10 @@ or snapshotting them. Each entry receives the registration event, with its
 timestamp replaced by the actual start time; storage of event data is a separate
 implementation concern from global variables. Bodies use the
 ordinary grammar, including functions, branches, and iteration. Registering a
-schedule does not wait for its entries to finish.
+schedule does not wait for its entries to finish and emits no immediate event.
+Each entry retains the current invocation's parameter bindings, if any, until
+its work no longer needs them. It captures event data and parameters, not globals;
+parameter bindings are not dynamically inherited from later callers.
 
 Invalid offsets and insufficient entry capacity reject the entire registration.
 Hardware conflicts discoverable only at entry execution fail that entry's job;
@@ -670,16 +826,17 @@ by `|` inside a syntax description are choices, not literal pipeline operators.
 | Hardware output | `write`, `shiftout`, `tone` |
 | Display | `lcd init`, `lcd print`, `lcd clear`; `oled init`, `oled print`, `oled chart`, `oled clear` |
 | Transformation | `map`, `not`, `toggle`, `split`, `ohm` |
+| Pure value functions | `number`, `int`, `string`, `abs`, `min`, `max`, `clamp`, `round`, `floor`, `ceil`, `len`, `contains`, `trim`, `lower`, `upper`, `slice`, `replace`, `at`, `join`, `notehz` (section 3) |
 | Event filtering | `where`, `edge`, `rising`, `falling`, `debounce`, `divide` |
 | Signal shaping | `pulse` |
 | Timing | `clock`, `every`, `sleep`, `schedule` |
-| Structure and state | `do`, `if`/`else`, `func`, `call`, `each`, `set` |
+| Structure and state | `do`, `if`/`else`, `func`, `each`, `set` |
 | Console and management | `print`, `help`, `pins`, `jobs`, `kill`, `status`, `reset` |
 | File execution | `run` (currently simulator-only; device support remains future work) |
 
 `else` is part of `if` syntax, not an independently invocable command. `var` is
-excluded from the language. Expression functions `int()`, `number()`, and
-`notehz()` are defined in section 3 rather than as pipeline commands.
+excluded from the language, as is the old `call` keyword. Built-in value
+functions are defined in section 3 and can also be used as pipeline stages.
 
 ### Alphabetical index of drafted entries
 
@@ -732,8 +889,9 @@ optional integer duration from `1` through `2147483647` milliseconds. Without
 `--dur`, the source continues until stopped. The existing optional direct-pin
 shorthand is not specified in this entry pending review; use an explicit `write`.
 
-**Output.** The source alternates primary values `1`, `0`, `1`, `0`, with one
-event per half-cycle. Each emitted event has fresh fields and its actual emission
+**Output.** The nominal waveform alternates primary values `1`, `0`, `1`, `0`,
+with one event per half-cycle when downstream work keeps up. Skipped transitions
+follow the phase rule below. Each emitted event has fresh fields and its actual emission
 timestamp. At 10 Hz, the nominal interval between events is 50 ms. The source
 does not forward an upstream primary value as its waveform.
 
@@ -741,8 +899,15 @@ does not forward an upstream primary value as its waveform.
 wait for its duration to expire. Placing `clock` after a pipe starts a new job
 for each upstream event. Downstream work runs sequentially per emitted event;
 busy work skips overdue transitions rather than queuing an unlimited burst.
+Waveform phase follows nominal transition deadlines: skipped transitions still
+advance phase, so consecutive delivered events can have the same value. Frequency
+does not become a count of delivered events. The first transition's nominal time
+and timer rounding remain catalog decisions to resolve before implementation.
+When `--dur` expires, no new events start, including at the exact end deadline.
+An event already in progress finishes its downstream work before the job releases
+its resources; expiration does not cancel a downstream wait. Explicit `kill` and
+`reset` still cancel the job immediately.
 Accepted frequency ranges describe validation, not a physical timing guarantee.
-Exact first-event phase remains to be specified consistently across runtimes.
 
 **Hardware and errors.** `clock` itself generates events; downstream actions
 claim hardware pins. Ending generation leaves those pins at their last driven
@@ -772,7 +937,7 @@ both is an error. Without an explicit value, an incoming primary value is requir
 **Output.** Replace the primary value with:
 
 ```text
-int(OUT_MIN + (VALUE - IN_MIN) * (OUT_MAX - OUT_MIN) / (IN_MAX - IN_MIN))
+(int (OUT_MIN + (VALUE - IN_MIN) * (OUT_MAX - OUT_MIN) / (IN_MAX - IN_MIN)))
 ```
 
 The final result truncates toward zero; intermediate calculations retain their
@@ -908,9 +1073,23 @@ Exceeding a bound produces a clear error. No silent truncation or dropped work i
 allowed except the documented skipped periodic ticks. Source- and event-specific
 resource counts must be documented if separate pools remain internally.
 
+Object counts alone are insufficient memory bounds. Before implementation, set
+explicit byte limits for individual strings, retained program storage (including
+active old function definitions), and retained value storage (including globals,
+lists, captured events, and parameter bindings). Exact byte budgets remain to be
+chosen against ESP8266 memory measurements; this draft does not authorize larger
+budgets. Shared storage counts once physically, but remains charged until its
+last owner releases it. Repeated submissions and interpolation must not bypass
+these limits. Enforce limits before committing a growing value or definition;
+exhaustion produces a clear error without truncation or partial replacement.
+
+Shift-register command entries must specify integer range and width consistently
+with binary64. A hardware frame width does not imply that all integers of that
+width are exactly representable. Arbitrary 64-bit integer preservation is not
+provided by the core number kind.
+
 The simulator must agree with firmware on value kinds, event propagation, scope,
 branch selection, ordering, and error behavior. Virtual time may bound unlimited
 sources with a sample count. It does not establish physical timing fidelity.
 Differences in resource planning or scheduling must be listed explicitly, not
 treated as alternative language semantics.
-
