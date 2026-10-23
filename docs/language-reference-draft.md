@@ -1,8 +1,9 @@
-# Commandware language reference — draft
+# Commandware language reference
 
-This document defines Commandware syntax and execution semantics. It is a draft
-specification; the firmware and simulator may not yet implement all described
-behavior.
+This document defines the shared Commandware syntax and execution contracts.
+The simulator and portable firmware runtime are checked against shared conformance
+cases. Physical timing, device transfers, and peak ESP8266 heap use still require
+board validation. The historical filename is retained for existing links.
 
 The current implementation guide is [language.md](language.md).
 
@@ -239,8 +240,7 @@ adc A0 | clamp $value 0 700 --out limited | print
 ### Built-in value-function catalog
 
 Lowercase words in the signatures below are parameter names, including their
-named-argument spelling. These are intended functions; implementations may lag
-behind this reference. Numeric parameters use strict numeric conversion. Text
+named-argument spelling. Both runtimes implement these functions. Numeric parameters use strict numeric conversion. Text
 and list parameters require their stated kinds; lists never convert implicitly
 to text or numbers. All numeric results must be finite.
 
@@ -253,14 +253,14 @@ to text or numbers. All numeric results must be finite.
 | `min a b` | Smaller numeric value |
 | `max a b` | Larger numeric value |
 | `clamp x low high` | Restrict a number to the inclusive range; reject `low > high` |
-| `round x` | Nearest integer; exact halfway behavior remains to be specified |
+| `round x` | Nearest integer; exact ties round away from zero |
 | `floor x` | Round toward negative infinity |
 | `ceil x` | Round toward positive infinity |
-| `len x` | String length or list item count |
+| `len x` | Unicode scalar count for strings, item count for lists |
 | `contains x item` | Substring test for strings, membership test for lists; return `0` or `1` |
-| `trim text` | Remove surrounding whitespace |
-| `lower text` | Convert letters to lowercase |
-| `upper text` | Convert letters to uppercase |
+| `trim text` | Remove surrounding ASCII space, tab, CR, LF, vertical tab, and form feed |
+| `lower text` | Convert ASCII A–Z to lowercase; preserve other characters |
+| `upper text` | Convert ASCII a–z to uppercase; preserve other characters |
 | `slice x start end` | Return a string or list range; zero-based start, exclusive end |
 | `replace text old new` | Replace all non-overlapping occurrences of `old` with `new` |
 | `at items index` | Return a list item using a zero-based integer index |
@@ -274,10 +274,18 @@ List operations return new values and never mutate their inputs. `split` remains
 a pipeline command that produces lists; this catalog adds no list literals,
 mutation, sorting, or general-purpose collection framework.
 
-Before implementing the affected functions, specify text encoding and the units
-used by string length/slicing, case conversion and whitespace rules, halfway
-rounding, list-membership equality, and empty search-text behavior for `contains`
-and `replace`. These open details must have identical contracts on both runtimes.
+Strings use valid UTF-8; invalid encoding is an error. `len` and string `slice`
+count Unicode scalar values, not bytes or grapheme clusters: an emoji may occupy
+one scalar, while an accented letter plus a combining mark occupies two. Case
+conversion and trimming are ASCII-only. Index arguments must be numeric integers;
+numeric text does not substitute for an index.
+
+List membership uses the scalar equality rules above: `2` matches `"2"`, but
+`"02"` and `"2"` differ. Comparing a list as a member is an error. Empty string
+searches match in `contains`, including in empty strings; an empty `old` argument
+to `replace` is an error. Replacement scans non-overlapping matches from left to
+right and never rescans inserted text. `round 2.5` is `3`, and `round (-2.5)` is
+`-3`. String/list operations enforce section 13's limits before returning growth.
 
 String-to-number conversion follows these rules:
 
@@ -420,7 +428,11 @@ is not atomic. Job ordering is not a synchronization mechanism.
 
 A block executes statements sequentially. A statement is one command or a
 pipeline; newlines and semicolons separate statements. Finite operations complete
-before the next statement begins.
+before the next statement begins, including pending delayed outputs and their
+downstream continuations. Likewise, an `each` item finishes its finite body and
+pending timers before the next item begins. This does not make a periodic source
+wait for a pulse/debounce deadline before accepting another source event: direct
+source pipelines can retrigger those stages while a timer is pending.
 
 Every statement starts with the same event supplied to that block invocation.
 Only an explicit `|` passes one command's output into another command. A statement's
@@ -809,12 +821,11 @@ failures remain observable after an interactive request has returned.
 ## 12. Command reference
 
 Commands are part of the language contract and follow the composition rules
-above. Entries describe intended behavior, including behavior not implemented
-yet. Firmware/simulator differences are tracked separately in the
+above. Entries define the shared software contracts. Verification status and
+physical-board work are tracked separately in the
 [implementation checklist](language-implementation-checklist.md).
 
-This first catalog installment defines `adc`, `clock`, `map`, `print`, `read`,
-and `write`. Entries for other commands remain to be drafted. Brackets denote
+The catalog covers the built-in command inventory. Brackets denote
 optional syntax, uppercase words denote arguments, and alternatives separated
 by `|` inside a syntax description are choices, not literal pipeline operators.
 
@@ -824,7 +835,7 @@ by `|` inside a syntax description are choices, not literal pipeline operators.
 | --- | --- |
 | Hardware input | `read`, `adc`, `shiftin` |
 | Hardware output | `write`, `shiftout`, `tone` |
-| Display | `lcd init`, `lcd print`, `lcd clear`; `oled init`, `oled print`, `oled chart`, `oled clear` |
+| Display | `lcd init`, `lcd print`, `lcd clear`; `oled init`, `oled print`, `oled chart`, `oled rect`, `oled clear` |
 | Transformation | `map`, `not`, `toggle`, `split`, `ohm` |
 | Pure value functions | `number`, `int`, `string`, `abs`, `min`, `max`, `clamp`, `round`, `floor`, `ceil`, `len`, `contains`, `trim`, `lower`, `upper`, `slice`, `replace`, `at`, `join`, `notehz` (section 3) |
 | Event filtering | `where`, `edge`, `rising`, `falling`, `debounce`, `divide` |
@@ -838,16 +849,28 @@ by `|` inside a syntax description are choices, not literal pipeline operators.
 excluded from the language, as is the old `call` keyword. Built-in value
 functions are defined in section 3 and can also be used as pipeline stages.
 
-### Alphabetical index of drafted entries
+### Alphabetical command index
 
-[adc](#adc) · [clock](#clock) · [map](#map) · [print](#print) ·
-[read](#read) · [write](#write)
+[adc](#adc) · [clock](#clock) · [debounce](#debounce) · [divide](#divide) ·
+[do](#do-each-func-if-and-set) · [each](#do-each-func-if-and-set) ·
+[edge](#edge-rising-and-falling) · [falling](#edge-rising-and-falling) ·
+[func](#do-each-func-if-and-set) · [help](#help-pins-jobs-and-status) ·
+[if](#do-each-func-if-and-set) · [jobs](#help-pins-jobs-and-status) ·
+[kill](#kill-and-reset) · [lcd](#lcd) · [map](#map) · [not](#not) ·
+[ohm](#ohm) · [oled](#oled) · [print](#print) · [pulse](#pulse) ·
+[read](#read) · [reset](#kill-and-reset) · [rising](#edge-rising-and-falling) ·
+[run](#run) · [schedule](#sleep-tone-every-and-schedule) ·
+[set](#do-each-func-if-and-set) · [shiftin](#shiftin-and-shiftout) ·
+[shiftout](#shiftin-and-shiftout) · [sleep](#sleep-tone-every-and-schedule) ·
+[split](#split) · [status](#help-pins-jobs-and-status) · [toggle](#toggle) ·
+[tone](#sleep-tone-every-and-schedule) · [where](#where) · [write](#write).
+Pure value functions are indexed in section 3's table.
 
 ### adc
 
 ```text
 adc A0 [--out NAME]
-adc A0 --watch
+adc A0 --watch [--out NAME]
 ```
 
 **Input and arguments.** `A0` identifies the ESP8266 analog input. One-shot `adc`
@@ -863,8 +886,7 @@ begins. `--watch` starts an independent background source that samples every
 100 ms. It emits the first sample and then only samples whose raw reading differs
 from the preceding sample. Its emitted events carry the reading, fresh fields,
 and the actual emission timestamp. It accepts the same downstream grammar as
-other sources. Use `--out` on one-shot `adc` to name readings; named bindings on
-source forms remain to be specified with the other source command entries.
+other sources. A final `--out NAME` binds each emitted reading in its fresh event.
 
 **Hardware and errors.** This command reads A0 without claiming a digital GPIO.
 Other analog identifiers, unsupported options, and unavailable background job
@@ -880,14 +902,14 @@ adc A0 --watch | oled chart
 ### clock
 
 ```text
-clock HZ [--dur MILLISECONDS]
+clock HZ [--dur MILLISECONDS] [--out NAME]
 ```
 
 **Input and arguments.** `HZ` is a numeric expression in the range `0.01` through
 `1000000`, inclusive, representing complete cycles per second. `--dur` is an
 optional integer duration from `1` through `2147483647` milliseconds. Without
-`--dur`, the source continues until stopped. The existing optional direct-pin
-shorthand is not specified in this entry pending review; use an explicit `write`.
+`--dur`, the source continues until stopped. Direct-pin shorthand is removed;
+use `clock HZ | write PIN`. A final `--out NAME` binds each waveform value.
 
 **Output.** The nominal waveform alternates primary values `1`, `0`, `1`, `0`,
 with one event per half-cycle when downstream work keeps up. Skipped transitions
@@ -901,8 +923,9 @@ for each upstream event. Downstream work runs sequentially per emitted event;
 busy work skips overdue transitions rather than queuing an unlimited burst.
 Waveform phase follows nominal transition deadlines: skipped transitions still
 advance phase, so consecutive delivered events can have the same value. Frequency
-does not become a count of delivered events. The first transition's nominal time
-and timer rounding remain catalog decisions to resolve before implementation.
+does not become a count of delivered events. The initial nominal level is low;
+the first event is high after one half-period. Round half-periods to the nearest
+whole microsecond, with ties upward and a minimum of one microsecond.
 When `--dur` expires, no new events start, including at the exact end deadline.
 An event already in progress finishes its downstream work before the job releases
 its resources; expiration does not cancel a downstream wait. Explicit `kill` and
@@ -966,7 +989,11 @@ print [VALUE | --value VALUE]
 **Input and arguments.** Print an explicit value if supplied; otherwise print
 the incoming primary value. Supplying both positional and named values is an
 error. Numeric and string values are supported; numeric formatting follows
-section 3. List formatting is not yet specified. Empty text and zero are valid.
+section 3. Lists use bracketed, comma-and-space-separated values, with strings
+quoted and escaped as JSON text: `["C4", "E4", 2]`. Numbers retain the binary64
+formatting rule. Console/display actions use this same list formatting. Lists
+cannot be interpolated into strings; use `join` for lists of strings. Empty text
+and zero are valid.
 
 **Output.** Write the selected value followed by a newline to the command output
 channel. Forward the incoming event unchanged, even when explicit text or a
@@ -1037,8 +1064,9 @@ ends when the job ends. A periodic job retains ownership between events.
 
 **Errors.** Missing both explicit and incoming values, unsupported list values,
 invalid/reserved pins, conflicting owners, and invalid arguments are errors.
-`--out` is not supported. Timed-write syntax is not defined in this entry;
-the existing duration forms require separate review.
+`--out` is not supported. Timed-write shorthand is removed. Use a sequential
+body such as `do { write 12 1; sleep 100; write 12 0 }` when an explicit
+return to low is required.
 
 ```text
 write 12 1
@@ -1049,44 +1077,409 @@ every 100 | adc A0 | write 12 $value > 700 | oled chart
 In the final example, the comparison selects the GPIO level while `oled chart`
 still receives the raw ADC reading.
 
+### debounce
+
+```text
+debounce MILLISECONDS
+```
+
+Require a primary value that converts numerically to `0` or `1`, including numeric
+text under section 3. Preserve its original kind when forwarding it. Retain the
+first level or a changed
+level as a candidate, then emit it after the specified positive integer duration
+from `1` through `2147483647` milliseconds without another change. Repeated identical input does not restart
+the deadline. A changed candidate replaces the pending candidate. Do not emit a
+level equal to the last accepted output. The initial level must also settle before
+its first emission. Preserve the candidate's fields and triggering timestamp.
+
+### divide
+
+```text
+divide N [--out NAME]
+```
+
+Require input that converts numerically to `0` or `1` and a positive integer
+divisor from `1` through `2147483647`. Emit initial output `0`
+on the first input. Count input transitions, ignoring duplicate levels. Every
+Nth transition toggles the output and emits the new level. Intermediate counts
+emit nothing. State starts independently for each stage occurrence and invocation.
+For inputs `0,0,1,1,0,0,1,0`, `divide 2` emits `0,1,0`. A final `--out`
+binds each produced level.
+
+### do, each, func, if, and set
+
+```text
+do { BODY }
+each [--out NAME] { BODY }
+func NAME [PARAMETER...] { BODY }
+NAME ARGUMENTS [--out NAME[,NAME...]]
+if EXPR { BODY } [else { BODY }]
+set NAME EXPR
+```
+
+Braces are required even for an empty body. Sections 5–9 define statement
+isolation, output binding, conditions, globals, function calls, and iteration.
+`set` emits its assigned value; actions inside a body preserve its input event.
+`each` executes its body for each list item, then forwards the original list once.
+Function calls and selected branches forward their final statement's results.
+
+Delayed outputs from a final statement, such as the low event of `pulse`, also
+continue through the enclosing block/function's downstream pipeline. This applies
+recursively to nested final statements. Outputs from earlier statements stay
+inside those statements; delayed item-body outputs do not become `each` outputs.
+The job retains pending continuations until completion or explicit cancellation.
+
+### edge, rising, and falling
+
+```text
+edge
+rising
+falling
+```
+
+Require primary values that convert numerically to `0` or `1`. The first value establishes a baseline and emits
+nothing. `edge` forwards both subsequent level changes, `rising` only `0` to `1`,
+and `falling` only `1` to `0`. Duplicate levels emit nothing. Accepted events keep
+their original primary kind/value, fields, and timestamp; these filters do not
+generate a new timestamp. `edge`, `rising`, `falling`, and `debounce` do not
+support `--out`; bind data upstream. Producers `divide` and `pulse` do.
+
+### help, pins, jobs, and status
+
+```text
+help [COMMAND]
+pins
+jobs
+status
+```
+
+Write diagnostic text to the command output and forward the incoming event
+unchanged, including its missing-value state. `help` describes the common command
+catalog; an optional command name is accepted but does not currently restrict its
+output.
+`pins` describes GPIO availability and reservations; `jobs` lists running/queued
+work and retained failures; `status` reports runtime/device state. Text and device
+fields may differ between simulator and hardware. These observations are allowed
+inside ordinary command bodies and do not create replacement values.
+
+### kill and reset
+
+```text
+kill ID
+reset
+```
+
+`kill` requires an integer existing job ID and cancels that job, including its
+pending callbacks/scheduled work. It forwards the caller's event unless the caller
+kills itself, in which case no remaining statements execute. Unknown IDs error.
+`reset` cancels all jobs, clears global variables and retained failures, and emits
+no event. Function definitions remain registered. Both release GPIO ownership
+without changing last levels or clearing display contents.
+
+### lcd
+
+```text
+lcd init [ADDRESS]
+lcd print [VALUE | --value VALUE]
+lcd clear
+```
+
+Support a 16×2 HD44780 LCD with the documented PCF8574 backpack mapping. The default
+seven-bit I2C address is `0x27`; valid addresses are `0x08`–`0x77`. `print` selects
+explicit data or the primary value and uses the console's scalar/list formatting.
+It replaces the screen from its top-left corner, wraps at 16 characters, clips
+at 32, and pads unused cells with spaces. `\n` starts the second row. `clear`
+blanks the screen. Commands preserve the incoming event. Missing print input,
+invalid options/addresses, pin conflicts, and failed transfers error.
+
+Initialization reserves GPIO4 (SDA) and GPIO5 (SCL) for the display bus; reject
+conflicting active owners. First use initializes automatically. Character ROM
+controls available glyphs; UTF-8 language support does not guarantee matching LCD
+glyphs. See the tutorial for electrical requirements.
+
+### not
+
+```text
+not [VALUE | --value VALUE] [--out NAME]
+```
+
+Select an explicit value or require the incoming primary value. Apply strict
+numeric conversion, replace zero with `1`, and any nonzero value with `0`.
+Preserve fields/timestamp; a final `--out` also binds the result.
+
+### ohm
+
+```text
+ohm [VALUE | --value VALUE] [--out NAME]
+```
+
+Select an explicit integer ADC count or the primary value. Convert it through the
+existing measured resistor-divider calibration, replacing the primary value with
+whole ohms or a range string. Counts 30–720 produce numeric results; counts below
+30 return `"<270"`, above 720 return `">700k"`, and outside 0–1023 return
+`"OUT_OF_RANGE"`. Fractional/nonnumeric input is an error. Preserve fields and
+timestamp and optionally bind the result. This is a transformation, with no
+implicit hardware read or print: use `adc A0 | ohm | print`. Circuit calibration
+and the uncalibrated 30–49 extrapolation are described in the tutorial.
+
+### oled
+
+```text
+oled init [ssd1306|sh1106] [--address ADDRESS] [--width 128] [--height 32|64]
+oled print [X Y] [VALUE | --value VALUE] [--x X --y Y]
+oled chart [X Y] [VALUE | --value VALUE] [--x X --y Y]
+    [--width WIDTH --height HEIGHT --min MIN --max MAX]
+oled clear
+```
+
+The two-line `chart` signature above is notation for one command. Supply all
+options on its command line. Default controller is SSD1306, address `0x3c`, and
+screen size 128×64. SH1106 uses its controller-specific column mapping. Select the
+actual controller explicitly; an I2C acknowledgment does not identify it.
+
+Printing uses explicit data or the primary value, formatted like console output.
+Coordinates default to `(0,0)`; positional coordinates and named coordinates
+cannot be combined. Printing changes its character cells rather than clearing the
+whole screen. The bundled bitmap font covers ASCII; unsupported glyphs follow
+the driver's fallback. `chart` requires a finite numeric reading, appends one
+sample in its rectangle, and defaults to the screen rectangle and range 0–1023.
+Screen geometry and range bounds are validated. `clear` removes text and chart
+history; initialization also clears previous contents. Commands preserve events.
+
+GPIO4/5 are reserved for I2C. Rendering is serviced cooperatively in short device
+transfers; invalid options, duplicate options, conflicting owners, invalid
+geometry/ranges, and transfer failures error. Software reset/kill preserves the
+last image. Simulation models pixels/history, not physical transfer timing.
+
+```text
+oled rect X Y WIDTH HEIGHT [--value 0|1]
+```
+
+`rect` fills a pixel rectangle, defaulting to on (`1`). Use `--value 0` to erase
+only that area. All four geometry arguments are required integer expressions;
+width/height must be positive and the entire rectangle must fit the configured
+display. Geometry is validated before initialization or drawing. A 1×1 rectangle
+draws one pixel. The command preserves the incoming event and ignores its primary
+value; only the explicit `--value` selects the pixel state. It has no `--out`.
+Rectangles share the framebuffer with text/charts and do not reset chart state.
+Transfers remain cooperative; multiple drawing commands do not guarantee an
+atomic display frame. See [Pong](examples/pong.cw) for erasing and moving sprites.
+
+### pulse
+
+```text
+pulse MILLISECONDS [--out NAME]
+```
+
+Any incoming event triggers a pulse, including one without a primary value.
+When inactive, emit `1` immediately and retain a pending `0` for the specified
+positive integer duration from `1` through `2147483647` milliseconds. While
+active, each input extends the low deadline
+to that input's time plus the duration without another `1`. The low event uses
+the most recent triggering event's fields and timestamp. After emitting low, the
+stage is inactive again. A final `--out` binds both high and low levels. There
+is no implicit pin write; pipe to `write PIN`.
+Zero-duration pulses are errors. Delayed downstream work belongs to the same owner job and is canceled with it. Finish an active
+downstream event, including its waits, before servicing a pending delayed
+continuation; timer expiry does not preempt that work.
+
+### run
+
+```text
+run "PATH"
+```
+
+Simulator-only file execution. Read UTF-8 source and use the normal statement,
+expression, and event rules. File contents do not select a legacy parser or feed
+one statement's output into the next. Missing/unreadable files and invalid source
+error. Firmware rejects `run` explicitly. Use `script load` to retrieve saved
+source into the web editor, then Run to execute it.
+
+### script
+
+```text
+script list [--out NAME]
+script save NAME
+script load NAME [--out NAME]
+script delete NAME
+```
+
+Firmware stores named UTF-8 source files in LittleFS under `/scripts`. Names are
+case-sensitive strings of 1–28 ASCII letters, digits, spaces, `_`, or `-`, without
+surrounding spaces. Quote names containing spaces or consisting only of digits.
+Paths, dots, and other characters are rejected; the internal `.cw` suffix is not
+part of the name. Command/action names ignore case.
+
+`list` produces a sorted list of names, including an empty list when no scripts
+are saved. `load` produces the exact source string, including whitespace and
+trailing newlines. Both preserve event fields/timestamp and support `--out`.
+Nothing prints implicitly: append `| print` for console output. Loading does not
+execute source, change runtime definitions, or register a boot script.
+
+`save` requires an incoming string value. It saves bytes verbatim without parsing
+or executing them, overwrites an existing name, and preserves the incoming event.
+An explicit empty string creates an empty script; missing/non-string input errors.
+`delete` removes a named script and preserves the incoming event. These actions
+do not support `--out`. Missing scripts and filesystem failures error normally.
+
+There are at most 32 scripts, each at most 4,096 UTF-8 bytes. Available flash and
+LittleFS metadata may reduce that capacity. Replacement needs free space for the
+new temporary file while the old file remains intact. Saves check writes and
+read back the temporary file before atomic rename; failures preserve the old
+script. An interrupted save may leave `/scripts/.pending`, which is ignored by
+listing and removed before the next save. Saved files survive runtime `reset`,
+reboot, and firmware-only updates that preserve the filesystem layout. Flash
+erasure, filesystem image uploads, and partition changes can destroy them.
+
+Mounting explicitly disables automatic formatting on ESP8266 and ESP32. A mount
+failure reports unavailable storage and leaves other commands usable. First use
+requires deliberate external provisioning of a LittleFS filesystem. The separate
+`provision-littlefs.sh` ESP8266 utility requires an upload confirmation and then
+`FORMAT LITTLEFS` over serial before erasing any files; see the
+[setup instructions](../README.md). Startup output and `status` distinguish mount,
+directory creation, and directory access errors and report the flash layout. The full
+firmware still targets ESP8266; only storage is portable to ESP32. The Python
+simulator models scripts in memory for the lifetime of its `ScriptRuntime`,
+including across `reset`; it does not write persistent host files.
+
+The web editor submits the same commands to `POST /api/command` as URL-encoded
+fields. Set `result=script` for a structured response; this mode accepts only
+one standalone `script` command. For `save`, include a separate `source` field,
+even for empty content. This seeds the incoming event value without escaping
+source into executable command text or consuming its 4,096-byte command budget.
+The source field is rejected for other actions.
+
+Responses are JSON: `{ "ok": true, "value": ... }`, with a name array for `list`,
+source text for `load`, and `null` for `save`/`delete`. Failures return HTTP 400 and
+`{ "ok": false, "error": "..." }`. Responses disable caching. Ordinary command
+requests retain their console-text responses. The editor fetches lists and
+contents from the device, confirms replacement/discard as before, and marks a
+buffer saved only after success. Failed requests preserve its text and dirty state.
+
+### shiftin and shiftout
+
+```text
+shiftin DATA CLOCK LOAD [msb|lsb] [--bits BITS] [--out NAME]
+shiftout DATA CLOCK [LATCH] [msb|lsb] [--value VALUE] [--bits BITS]
+```
+
+Pins use `read`/`write`'s integer GPIO and ownership rules. Pins in one operation
+must be distinct. Default bit order is `msb`; default frame width is 8, with
+explicit `--bits` from 1 through 53. Width is always named, avoiding ambiguity
+with a value or optional latch. `shiftout` without a latch uses two hardware pins. Explicit data uses `--value`;
+otherwise use the incoming primary value. There is no positional payload, which
+would be ambiguous with the optional latch pin.
+
+`shiftin` pulses LOAD low/high, samples the first data bit before the first clock
+pulse, clocks the frame, and replaces the primary value with its unsigned integer.
+`shiftout` selects explicit data or the incoming primary, requires an integer in
+`0..2^BITS-1`, clocks one frame, and optionally pulses the latch. It preserves the
+incoming event even when explicit data differs. Both preserve fields/timestamp;
+only `shiftin` supports `--out`. Pins remain owned until the job ends and retain
+last levels afterward. Unsupported widths/order/options, duplicate pins, missing
+input, out-of-range integers, and ownership conflicts error. Simulation models
+bit order and GPIO histories; verify edge timing and register compatibility on
+the actual circuit.
+
+### sleep, tone, every, and schedule
+
+```text
+sleep MILLISECONDS
+tone PIN --hz HZ --dur MILLISECONDS
+every INTERVAL [--out NAME]
+schedule { OFFSET_EXPR { BODY } ... }
+```
+
+Section 10 defines cooperative waits, periodic deadlines, and schedule capture.
+`sleep` and `tone` preserve their event. Tone frequency is `0.01..1000000` Hz;
+round half-periods to whole microseconds with ties upward/minimum one. A positive
+duration claims the GPIO and starts low, switching after one half-period. A
+zero-duration tone validates its pin/reservations/frequency but does not drive
+or wait. Completion releases ownership when its
+job finishes and never adds a cleanup write. Explicitly write a level afterward
+if the circuit requires it. Software GPIO and loop scheduling provide best-effort
+timing, not a guarantee of frequency fidelity.
+
+`every` requires an integer interval from `1` through `2147483647` milliseconds.
+It emits `0` at first service and then on its fixed registration timeline.
+A final `--out` binds each emitted value, also for `clock` and `adc --watch`.
+Source events have fresh fields and an actual service timestamp; registration
+emits nothing. Schedules evaluate each offset once, capture event/parameters,
+and read live globals when entries execute. Body braces are mandatory. Delayed
+signal continuations preserve their triggering timestamps, while schedule entry
+start replaces its captured timestamp with the actual start time. No source or
+transformation prints implicitly; add `| print` when console data is wanted.
+
+### split
+
+```text
+split DELIMITER [VALUE | --value VALUE] [--out NAME[,NAME...]]
+```
+
+Require a nonempty string delimiter and explicit or incoming string input.
+Replace the primary value with a list of substrings, preserving empty substrings,
+fields, and timestamp. Matching is literal and non-overlapping. `--out` may bind
+the entire list or unpack it into exactly as many names as items. Enforce the
+64-item limit; invalid kinds/empty delimiter/missing input/count mismatch error.
+
+### toggle
+
+```text
+toggle [--out NAME]
+```
+
+Start at state `0`, flip on each incoming event, and emit `1`, then `0`, and so
+on. An event does not need a primary value. Preserve fields/timestamp. State is
+per owning stage occurrence, with fresh state on each function invocation.
+
+### where
+
+```text
+where EXPR
+```
+
+Evaluate a condition once using section 3's strict numeric truth rules. Forward
+the incoming event unchanged when nonzero; otherwise emit nothing. This suppresses
+only the remainder of the current statement, not subsequent sibling statements.
+
 ## 13. Bounds and simulator agreement
 
-Existing firmware bounds are the initial implementation targets, not expanded
-budgets authorized by this draft:
+The initial shared software limits are:
 
-| Resource | Current bound |
+| Resource | Bound |
 | --- | --- |
-| Submission | 4,096 source bytes |
-| Parsed commands | 128 |
-| Nested blocks | 8 |
-| Nested function calls | 8 |
-| Function definitions | 16 |
-| Global variables | Proposed: 32 total, replacing the current per-scope bound |
-| Named fields per event | 16 |
-| List elements | 64 |
-| Pending continuation frames | 128 |
-| Script jobs | 8 |
-| Clock/ADC slots | 8, currently separate |
-| Pending schedule entries | 32 |
+| Submission | 4,096 UTF-8 source bytes |
+| Retained command AST nodes across definitions/tasks/timers | 128 total; shared nodes count once |
+| Nested blocks / function calls / expression nesting | 8 / 8 / 16 |
+| Function definitions / global variables | 16 / 32 |
+| Named fields per event / list elements | 16 / 64 |
+| Individual string | 4,096 UTF-8 bytes |
+| Pending continuation frames across jobs/timers | 128 total |
+| Active script/source jobs | 8 shared slots |
+| Pending schedule entries | 32, separate until execution begins |
+| Retained value payload | 8,192 bytes |
+| Retained program source | 16,384 UTF-8 bytes |
+| Retained failures | Last 8 |
 
-Exceeding a bound produces a clear error. No silent truncation or dropped work is
-allowed except the documented skipped periodic ticks. Source- and event-specific
-resource counts must be documented if separate pools remain internally.
+These are initial implementation defaults, pending peak-heap measurements on an
+ESP8266. Retained program accounting charges each retained submission source once,
+including old definitions and active task/timer continuations. A number costs
+8 payload bytes; a string costs its UTF-8 byte length; a list costs its item
+payloads. Stored names contribute their UTF-8 bytes. Globals, captured parameters,
+events, fields, and pending timer values remain charged for their retained lifetime.
+Shared ownership of the same event/scope is counted once; copied events carry
+separate payload charges. Object counts bound interpreter overhead separately;
+these logical budgets do not measure allocator overhead or establish free heap.
 
-Object counts alone are insufficient memory bounds. Before implementation, set
-explicit byte limits for individual strings, retained program storage (including
-active old function definitions), and retained value storage (including globals,
-lists, captured events, and parameter bindings). Exact byte budgets remain to be
-chosen against ESP8266 memory measurements; this draft does not authorize larger
-budgets. Shared storage counts once physically, but remains charged until its
-last owner releases it. Repeated submissions and interpolation must not bypass
-these limits. Enforce limits before committing a growing value or definition;
-exhaustion produces a clear error without truncation or partial replacement.
+Exceeding a bound reports an error. Do not truncate strings/lists or silently drop
+work, apart from the specified skipped periodic ticks. Reject growing assignments
+and definitions before replacing stored data. A rejected registration must not
+leave a partially registered schedule. Queued entries need an active slot when
+they actually start; data-dependent resource conflicts fail the affected job.
 
-Shift-register command entries must specify integer range and width consistently
-with binary64. A hardware frame width does not imply that all integers of that
-width are exactly representable. Arbitrary 64-bit integer preservation is not
-provided by the core number kind.
+Shift frames are 1–53 bits, defaulting to 8. Valid frame values are integers from
+0 through `2^bits - 1`, so every supported value is exactly representable in
+binary64. Arbitrary 64-bit integer preservation is not provided.
 
 The simulator must agree with firmware on value kinds, event propagation, scope,
 branch selection, ordering, and error behavior. Virtual time may bound unlimited

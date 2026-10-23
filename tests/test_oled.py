@@ -5,6 +5,44 @@ from commandware.script import ScriptRuntime
 from commandware.oled_font import FONT
 
 
+def test_rect_fills_erases_and_preserves_event_and_neighbors():
+    hw = HardwareState()
+    assert run_stream('number 7 --out original | oled rect 2 7 3 4 | print $original | print', hardware=hw) == [7, 7]
+    assert {(x, y) for y in range(64) for x in range(128) if hw.oled.pixel(x, y)} == {
+        (x, y) for y in range(7, 11) for x in range(2, 5)
+    }
+    run_stream('oled rect 3 8 1 2 --value 0', hardware=hw)
+    assert not hw.oled.pixel(3, 8) and not hw.oled.pixel(3, 9)
+    assert hw.oled.pixel(2, 8) and hw.oled.pixel(3, 7)
+    # The default is on, even when the incoming primary is zero.
+    run_stream('number 0 | oled rect 127 63 1 1', hardware=hw)
+    assert hw.oled.pixel(127, 63)
+
+
+@pytest.mark.parametrize('command', [
+    'oled rect', 'oled rect 0 0 1', 'oled rect 0 0 1 1 1',
+    'oled rect 0 0 0 1', 'oled rect 127 63 2 1', 'oled rect 0 63 1 2',
+    'oled rect (-1) 0 1 1', 'oled rect 0.5 0 1 1',
+    'oled rect 0 0 1 1 --value 2', 'oled rect 0 0 1 1 --value "bad"',
+    'oled rect 0 0 1 1 --value', 'oled rect 0 0 1 1 --value 0 --value 1',
+    'oled rect 0 0 1 1 --x 0',
+])
+def test_invalid_rect_has_no_hardware_side_effects(command):
+    hw = HardwareState()
+    with pytest.raises(ValueError, match='at line 1'):
+        run_stream(command, hardware=hw)
+    assert not hw.oled.ready and not any(hw.oled.buffer)
+
+
+def test_rect_respects_32_pixel_display_and_does_not_change_invalid_buffer():
+    hw = HardwareState()
+    run_stream('oled init sh1106 --height 32; oled rect 127 31 1 1', hardware=hw)
+    before = bytes(hw.oled.buffer)
+    with pytest.raises(ValueError):
+        run_stream('oled rect 0 31 1 2', hardware=hw)
+    assert bytes(hw.oled.buffer) == before
+
+
 @pytest.mark.parametrize('controller,height,address', [('ssd1306',64,0x3c), ('SH1106',64,0x3d), ('ssd1306',32,0x3c), ('sh1106',32,0x3c)])
 def test_init_controller_dimensions_and_address(controller, height, address):
     hw = HardwareState()
@@ -51,8 +89,8 @@ def test_two_chart_areas_and_script_variables():
     hw = HardwareState()
     run_stream('''do {
         oled init sh1106
-        var temp 23
-        var humidity 48
+        set temp 23
+        set humidity 48
         every 100 |
             oled chart $temp --min 0 --max 50 --height 32 |
             oled chart $humidity --min 0 --max 100 --y 32 --height 32
@@ -63,7 +101,9 @@ def test_two_chart_areas_and_script_variables():
 
 def test_live_watch_and_scheduled_oled():
     hw = HardwareState()
-    assert run_stream('adc A0 --watch | oled print', [512,512,7], hardware=hw) == []
+    samples = iter([512, 512, 7])
+    hw.read_analog = lambda pin: next(samples)
+    assert run_stream('adc A0 --watch | oled print', hardware=hw, count=3) == []
     assert hw.oled.text_history == [(0,0,'512'),(0,0,'7')]
     run_stream('schedule { 10 { oled print 2 2 "scheduled" } }', hardware=hw)
     assert hw.oled.text_history[-1] == (2,2,'scheduled')
@@ -100,7 +140,9 @@ def test_chart_limits_overlap_and_range_change():
 def test_oled_pin_reservation_and_existing_owner():
     hw = HardwareState()
     runtime = ScriptRuntime(hw)
+    runtime.repeat_count = 100
     runtime.submit('every 10 | write 4 1')
+    runtime.tick(0)
     runtime.tick(0)
     with pytest.raises(ValueError, match='owned by a job'):
         run_stream('oled init', hardware=hw)
@@ -110,9 +152,10 @@ def test_oled_pin_reservation_and_existing_owner():
         with pytest.raises(ValueError, match='reserved'):
             run_stream(command, hardware=hw)
     assert 'OLED I2C' in '\n'.join(run_stream('pins', hardware=hw))
-    run_stream('var led 12', hardware=hw)
+    run_stream('set led 12', hardware=hw)
     run_stream('write $led 1', hardware=hw)
-    assert hw.script_writes[-2:] == [(runtime.now,12,1), (runtime.now,12,0)]
+    assert hw.script_writes[-1:] == [(runtime.now,12,1)]
+    assert hw.gpio[12] == 1 and not hw.pin_owners
 
 
 def test_display_contents_and_reservation_survive_reset():

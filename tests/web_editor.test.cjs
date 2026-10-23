@@ -5,10 +5,11 @@ const vm = require('node:vm');
 const sketch = fs.readFileSync(path.join(__dirname, '../firmware/esp12e_commandware/esp12e_commandware.ino'), 'utf8');
 const script = sketch.match(/<script>([\s\S]*?)<\/script>/)[1];
 
-function client(cdn = 'loaded', storage = new Map()) {
+function client(cdn = 'loaded', scripts = new Map()) {
   const elements = new Map(), timers = new Map(), calls = [], assets = [];
   const confirmations = [], answers = [];
   let nextTimer = 0, mode, cm;
+  const network = {fail: false, pause: null};
   function element() {
     return {value: '', selectionStart: 0, selectionEnd: 0, textContent: '', style: {}, children: [], attributes: {}, events: {},
       append(...children) {this.children.push(...children);},
@@ -33,11 +34,25 @@ function client(cdn = 'loaded', storage = new Map()) {
   };
   const context = vm.createContext({document, URLSearchParams, AbortController,
     confirm(message) {confirmations.push(message); return answers.length ? answers.shift() : true;},
-    localStorage: {getItem: key => storage.has(key) ? storage.get(key) : null, setItem: (key, value) => storage.set(key, value)},
     setTimeout(callback, delay) {timers.set(++nextTimer, {callback, delay}); return nextTimer;},
     clearTimeout(id) {timers.delete(id);}, setInterval() {},
-    fetch: async (_, options) => {
+    fetch: async (url, options) => {
+      if (url === '/api/jobs') return {ok: true, text: async () => ''};
       const command = options.body.get('command'); calls.push(command);
+      if(options.body.get('result') === 'script') {
+        const action=command.split(' ')[1];
+        if(network.pause) {const pause=network.pause;network.pause=null;await pause;}
+        if(network.fail) return {ok:false,text:async()=>JSON.stringify({ok:false,error:'device storage unavailable'})};
+        const name=action==='list'?null:JSON.parse(command.slice(('script '+action+' ').length));
+        let value=null;
+        if(action==='list') value=[...scripts.keys()].sort();
+        else if(action==='save') {assert(options.body.has('source'));scripts.set(name,options.body.get('source'));}
+        else if(action==='load') {
+          if(!scripts.has(name))return {ok:false,text:async()=>JSON.stringify({ok:false,error:'script not found'})};
+          value=scripts.get(name);
+        }
+        return {ok:true,text:async()=>JSON.stringify({ok:true,value})};
+      }
       return {ok: true, text: async () => command === 'jobs' ? '' : 'OK\n' + command};
     },
     CodeMirror: {
@@ -55,7 +70,7 @@ function client(cdn = 'loaded', storage = new Map()) {
     }
   });
   vm.runInContext(script, context);
-  return {context, elements, timers, calls, assets, storage, confirmations, answers, get cm() {return cm;}, get mode() {return mode;}};
+  return {context, elements, timers, calls, assets, scripts, network, confirmations, answers, get cm() {return cm;}, get mode() {return mode;}};
 }
 const settle = () => new Promise(resolve => setImmediate(resolve));
 const descendants = node => node.children.flatMap(child => [child, ...descendants(child)]);
@@ -164,20 +179,21 @@ const sampleButtons = node => descendants(node).filter(child => child.attributes
       if(files.cm)files.cm.setValue(text);
       else{el('command').value=text;el('command').events.input();}
     };
-    const draftText = 'do {\n  oled print "Saved script"\n}';
+    const draftText = '  do {\n  oled print "$literal é雪"\n}\n\n';
     write(draftText);
     assert.match(el('script-title').textContent, /Untitled.*Unsaved/);
     el('save-script').onclick();
     assert(el('save-dialog').open);
     el('script-name').value = '  OLED demo  ';
-    el('save-form').onsubmit({preventDefault() {}});
+    await el('save-form').onsubmit({preventDefault() {}});
     assert.equal(el('save-dialog').open, false);
     assert.equal(el('script-title').textContent, 'OLED demo');
-    assert.equal(JSON.parse(files.storage.get('commandware.scripts.v1'))[0].source, draftText);
+    assert.equal(files.scripts.get('OLED demo'), draftText);
+    assert.match(el('file-message').textContent,/Saved on device/);
 
-    write(draftText + '\noled clear');
-    el('save-script').onclick();
-    assert.equal(JSON.parse(files.storage.get('commandware.scripts.v1')).length, 1);
+    write(draftText + 'oled clear');
+    el('save-script').onclick();await settle();
+    assert.equal(files.scripts.size, 1);
     assert.equal(el('script-title').textContent, 'OLED demo');
     const savedText = files.context.editorValue();
     write('print "unsaved"');
@@ -187,53 +203,77 @@ const sampleButtons = node => descendants(node).filter(child => child.attributes
     assert.equal(files.context.editorValue(), '');
     assert.equal(el('script-title').textContent, 'Untitled');
 
-    el('open-script').onclick();
+    await el('open-script').onclick();
     assert.equal(el('saved-scripts').children[0].textContent, 'OLED demo');
     write('print "keep me"');
-    files.answers.push(false);el('saved-scripts').children[0].onclick();
+    files.answers.push(false);await el('saved-scripts').children[0].onclick();
     assert.equal(files.context.editorValue(), 'print "keep me"');
     assert(el('open-dialog').open);
-    files.answers.push(true);el('saved-scripts').children[0].onclick();
+    files.answers.push(true);await el('saved-scripts').children[0].onclick();
     assert.equal(files.context.editorValue(), savedText);
     assert.equal(el('open-dialog').open, false);
     assert.equal(el('script-title').textContent, 'OLED demo');
 
-    const reloaded = client(cdn, files.storage);
+    const reloaded = client(cdn, files.scripts);
     await settle();
-    reloaded.elements.get('open-script').onclick();
-    reloaded.elements.get('saved-scripts').children[0].onclick();
+    await reloaded.elements.get('open-script').onclick();
+    await reloaded.elements.get('saved-scripts').children[0].onclick();
     assert.equal(reloaded.context.editorValue(), savedText);
-    console.log(`PASS named scripts save, update, reopen after reload, and protect unsaved edits (${cdn})`);
+    console.log(`PASS device scripts save, update, reopen from another client, and protect edits (${cdn})`);
 
     el('new-script').onclick();write('replacement');
     el('save-script').onclick();el('script-name').value='OLED demo';
-    files.answers.push(false);el('save-form').onsubmit({preventDefault() {}});
-    assert.equal(JSON.parse(files.storage.get('commandware.scripts.v1'))[0].source, savedText);
+    files.answers.push(false);await el('save-form').onsubmit({preventDefault() {}});
+    assert.equal(files.scripts.get('OLED demo'), savedText);
     assert(el('save-dialog').open);
-    files.answers.push(true);el('save-form').onsubmit({preventDefault() {}});
-    assert.equal(JSON.parse(files.storage.get('commandware.scripts.v1'))[0].source, 'replacement');
-    write('quota failure draft');
-    files.context.localStorage.setItem=()=>{throw Error('QuotaExceededError');};
-    el('save-script').onclick();
-    assert.equal(files.context.editorValue(), 'quota failure draft');
+    files.answers.push(true);await el('save-form').onsubmit({preventDefault() {}});
+    assert.equal(files.scripts.get('OLED demo'), 'replacement');
+    write('failed save draft');
+    files.network.fail=true;
+    el('save-script').onclick();await settle();
+    assert.equal(files.context.editorValue(), 'failed save draft');
     assert.match(el('script-title').textContent, /Unsaved changes/);
     assert.match(el('file-message').textContent, /Unable to save/);
-    assert.equal(JSON.parse(files.storage.get('commandware.scripts.v1'))[0].source, 'replacement');
-    console.log(`PASS duplicate-name cancellation and storage failures preserve scripts and drafts (${cdn})`);
-  }
+    assert.equal(files.scripts.get('OLED demo'), 'replacement');
+    await el('open-script').onclick();
+    assert.match(el('file-message').textContent,/Unable to read saved scripts/);
+    files.network.fail=false;
+    await el('open-script').onclick();
+    files.network.fail=true;
+    await el('saved-scripts').children[0].onclick();
+    assert.equal(files.context.editorValue(), 'failed save draft');
+    assert.match(el('file-message').textContent,/Unable to open/);
+    files.network.fail=false;
+    // A script deleted by another client is fetched again rather than cached.
+    files.scripts.delete('OLED demo');
+    await el('saved-scripts').children[0].onclick();
+    assert.equal(files.context.editorValue(),'failed save draft');
+    assert.match(el('file-message').textContent,/script not found/);
+    console.log(`PASS duplicate cancellation, device errors, and deleted scripts preserve drafts (${cdn})`);
 
-  const invalid = client('failed', new Map([['commandware.scripts.v1', '{broken json']]));
-  await settle();
-  invalid.elements.get('command').value = 'keep my draft';
-  invalid.elements.get('open-script').onclick();
-  assert.match(invalid.elements.get('file-message').textContent, /Unable to read/);
-  invalid.elements.get('save-script').onclick();invalid.elements.get('script-name').value='New name';
-  invalid.elements.get('save-form').onsubmit({preventDefault() {}});
-  assert.equal(invalid.storage.get('commandware.scripts.v1'), '{broken json');
-  assert.equal(invalid.elements.get('command').value, 'keep my draft');
-  assert(invalid.elements.get('save-dialog').open);
-  assert.match(invalid.elements.get('save-error').textContent, /Unable to save/);
-  console.log('PASS invalid stored data is reported without overwriting storage or editor text');
+    files.scripts.set('OLED demo','saved text');
+    await el('open-script').onclick();
+    let releaseLoad;
+    files.network.pause=new Promise(resolve=>{releaseLoad=resolve});
+    const loading=el('saved-scripts').children[0].onclick();
+    await settle();el('cancel-open').onclick();releaseLoad();await loading;
+    assert.equal(files.context.editorValue(),'failed save draft');
+    assert.equal(el('open-dialog').open,false);
+    console.log(`PASS canceling a pending open leaves the editor unchanged (${cdn})`);
+
+    let resume;
+    files.network.pause=new Promise(resolve=>{resume=resolve});
+    write('snapshot');
+    const saving=files.context.saveScript('OLED demo');
+    await settle();write('edited during request');resume();
+    assert.equal(await saving,true);
+    assert.equal(files.scripts.get('OLED demo'),'snapshot');
+    assert.equal(files.context.editorValue(),'edited during request');
+    assert.match(el('script-title').textContent,/Unsaved changes/);
+    assert.equal(await files.context.saveScript('../bad'),false);
+    assert.match(el('save-error').textContent,/1–28/);
+    console.log(`PASS save snapshots and invalid names preserve later edits (${cdn})`);
+  }
 
   const slow = client('pending');
   slow.elements.get('command').value = 'read 12';

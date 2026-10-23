@@ -3,6 +3,8 @@ from dataclasses import dataclass, field
 import math
 
 from .oled_font import FONT
+from .expressions import numeric, format_number
+import json
 
 
 @dataclass
@@ -34,30 +36,28 @@ class OledDisplay:
     @staticmethod
     def _numeric(value):
         try:
-            result = float(value)
-        except (ValueError, TypeError, OverflowError):
+            return numeric(value)
+        except (ValueError, OverflowError):
             raise ValueError("oled: value must be finite and numeric") from None
-        if not math.isfinite(result):
-            raise ValueError("oled: value must be finite and numeric")
-        return result
 
-    def command(self, args, event_value=None, has_value=False, hardware=None):
+    def command(self, args, event_value=None, has_value=False, hardware=None, strict_options=False):
         if not args:
-            raise ValueError("oled: use init, print, chart, or clear")
+            raise ValueError("oled: use init, print, chart, rect, or clear")
         action = str(args[0]).lower()
         allowed = {
             "init": {"--address", "--width", "--height"},
             "print": {"--x", "--y", "--value"},
             "chart": {"--x", "--y", "--width", "--height", "--min", "--max", "--value"},
             "clear": set(),
+            "rect": {"--value"},
         }
         if action not in allowed:
-            raise ValueError("oled: use init, print, chart, or clear")
+            raise ValueError("oled: use init, print, chart, rect, or clear")
         positional, options = [], {}
         i = 1
         while i < len(args):
             key = str(args[i])
-            if key.startswith("--"):
+            if key.startswith("--") and (not strict_options or getattr(args[i], "option", False)):
                 if key not in allowed[action] or i + 1 == len(args) or key in options:
                     raise ValueError(f"oled: invalid, duplicate, or missing option '{key}'")
                 options[key] = args[i + 1]
@@ -104,6 +104,24 @@ class OledDisplay:
             self.buffer[:] = bytes(1024)
             self.charts.clear()
             return
+        if action == "rect":
+            if len(positional) != 4:
+                raise ValueError("oled: rect requires X Y WIDTH HEIGHT")
+            geometry = [self._numeric(item) for item in positional]
+            if any(item != int(item) or not 0 <= item <= 128 for item in geometry):
+                raise ValueError("oled: rect geometry must be nonnegative integers in range")
+            x, y, width, height = map(int, geometry)
+            if width < 1 or height < 1 or x + width > 128 or y + height > self.height:
+                raise ValueError("oled: rect must fit the display and be at least 1x1")
+            on = self._numeric(options.get("--value", 1))
+            if on not in (0, 1):
+                raise ValueError("oled: rect value must be 0 or 1")
+            if not self.ready:
+                initialize(self.controller, self.height, self.address)
+            for row in range(y, y + height):
+                for col in range(x, x + width):
+                    self.pixel(col, row, bool(on))
+            return
         x, y = integer("--x", 0), integer("--y", 0)
         if len(positional) >= 2:
             if "--x" in options or "--y" in options:
@@ -142,7 +160,8 @@ class OledDisplay:
         if not self.ready:
             initialize(self.controller, self.height, self.address)
         if action == "print":
-            text = format(value, ".12g") if isinstance(value, (int, float)) else str(value)
+            text = ("[" + ", ".join(json.dumps(item, ensure_ascii=False) if isinstance(item, str) else format_number(item) for item in value) + "]"
+                    if isinstance(value, list) else format_number(value) if isinstance(value, (int, float)) else str(value))
             self.text_history.append((x, y, text))
             origin = x
             for char in text.encode("utf-8"):

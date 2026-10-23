@@ -25,8 +25,9 @@ def _read_stdin_values() -> list[object]:
 
 
 def _emit_values(values: Sequence[object]) -> None:
+    from .script import display
     for value in values:
-        print(value)
+        print(display(value))
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -40,6 +41,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     command = args[0] if len(args) == 1 else shlex.join(args)
     values = _read_stdin_values()
     hardware = HardwareState()
-    output = run_stream(command, values=values, hardware=hardware)
+    output = run_stream(command, values=values if values else None, hardware=hardware)
     _emit_values(output)
     return 0

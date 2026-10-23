@@ -37,12 +37,7 @@ class OledDisplay {
         return false;
     }
     static bool numeric(const Value &value, double &result) {
-        if (value.kind == Value::NUMBER) result = value.number;
-        else if (value.kind == Value::TEXT && !value.text.empty()) {
-            char *end; result = strtod(value.text.c_str(), &end);
-            if (*end || end == value.text.c_str()) return false;
-        } else return false;
-        return std::isfinite(result);
+        std::string error; result = numericValue(value, error); return error.empty();
     }
     bool initializeOnce(bool sh, int newHeight, int newAddress, uint16_t line, uint32_t now, std::string &error) {
         lastPacketStatus = 0;
@@ -125,15 +120,15 @@ public:
 
     bool command(const std::vector<Value> &args, const Event &event, uint16_t line, uint32_t now, std::string &error) {
         auto fail = [&](const std::string &message) { error = "oled: " + message; return false; };
-        if (args.empty()) return fail("use init, print, chart, or clear");
+        if (args.empty()) return fail("use init, print, chart, rect, or clear");
         std::string action = lower(args[0].str());
         std::vector<Value> positional;
         std::map<std::string, Value> options;
         std::string allowed = action == "init" ? " --address --width --height " :
-            action == "print" ? " --x --y --value " : action == "chart" ? " --x --y --width --height --min --max --value " : " ";
+            action == "print" ? " --x --y --value " : action == "chart" ? " --x --y --width --height --min --max --value " : action == "rect" ? " --value " : " ";
         for (size_t i = 1; i < args.size(); ++i) {
             std::string key = args[i].str();
-            if (key.compare(0, 2, "--") == 0) {
+            if (args[i].option && key.compare(0, 2, "--") == 0) {
                 if (allowed.find(" " + key + " ") == std::string::npos || i+1 == args.size() || options.count(key))
                     return fail("invalid, duplicate, or missing option '" + key + "'");
                 options[key] = args[++i];
@@ -163,7 +158,29 @@ public:
             buffer.fill(0); charts = {}; dirty = (uint8_t)((1 << (height/8))-1); lines.fill(line);
             return true;
         }
-        if (action != "print" && action != "chart") return fail("use init, print, chart, or clear");
+        if (action == "rect") {
+            if (positional.size() != 4) return fail("rect requires X Y WIDTH HEIGHT");
+            int geometry[4];
+            for (int i = 0; i < 4; ++i) {
+                double v;
+                if (!numeric(positional[i], v) || v != std::trunc(v) || v < 0 || v > 128)
+                    return fail("rect geometry must be nonnegative integers in range");
+                geometry[i] = (int)v;
+            }
+            int x = geometry[0], y = geometry[1], w = geometry[2], h = geometry[3];
+            if (w < 1 || h < 1 || x+w > 128 || y+h > height)
+                return fail("rect must fit the display and be at least 1x1");
+            double on = 1;
+            if (options.count("--value") && !numeric(options["--value"], on))
+                return fail("rect value must be 0 or 1");
+            if (on != 0 && on != 1) return fail("rect value must be 0 or 1");
+            if (faulted) return fail("display transfer failed; run oled init");
+            if (!ready && !initialize(sh1106, height, address, line, now, error)) return false;
+            for (int row = y; row < y+h; ++row)
+                for (int col = x; col < x+w; ++col) pixel(col, row, on != 0, line);
+            return true;
+        }
+        if (action != "print" && action != "chart") return fail("use init, print, chart, rect, or clear");
         int x, y;
         if (!integer("--x", 0, x) || !integer("--y", 0, y)) return fail("x and y must be nonnegative integers");
         if (positional.size() >= 2) {
@@ -200,7 +217,7 @@ public:
         if (!ready && !initialize(sh1106, height, address, line, now, error)) return false;
         if (action == "print") {
             int origin = x;
-            for (unsigned char ch : value.str()) {
+            for (unsigned char ch : formatValue(value)) {
                 if (ch == '\n') { x = origin; y += 8; continue; }
                 if (x+6 > 128) { x = origin; y += 8; }
                 if (y+8 > height) break;

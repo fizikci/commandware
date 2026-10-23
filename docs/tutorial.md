@@ -1,73 +1,16 @@
 # Commandware tutorial
 
-This guide uses the current ESP8266 firmware. Commands go into the serial console
-at 115200 baud or the web console. Use ESP8266 GPIO numbers, not a board's `D`
-labels. Run each example separately unless it is a single schedule or `do` block.
-See [Commandware scripting](language.md) for initialization blocks, periodic
-sampling with `every`, named outputs, variables, functions, and sequential music
-playback. The complete [notes-and-blink program](examples/notes-and-blink.cw)
-plays two notes while an independent LED job runs.
+Commandware lets you experiment with hardware by submitting small programs over
+serial or the web console. Start with the [README](../README.md) for firmware
+build/upload instructions. The [language guide](language.md) explains the model;
+the [reference](language-reference-draft.md) defines every command contract.
 
-## Connect to the board
+## Connect and inspect
 
-Follow the [README build and upload steps](../README.md#getting-started).
-
-
-The firmware can join an existing Wi-Fi network and expose the command shell to
-devices on that same network. Before compiling, copy
-[`wifi_config.example.h`](../firmware/esp12e_commandware/wifi_config.example.h) to
-`wifi_config.h` in the same directory:
-
-```powershell
-Copy-Item firmware/esp12e_commandware/wifi_config.example.h firmware/esp12e_commandware/wifi_config.h
-```
-
-Set `COMMANDWARE_WIFI_SSID` and `COMMANDWARE_WIFI_PASSWORD` in your local
-`wifi_config.h`. Git ignores that file; commit only the empty example header.
-The firmware uses the local header when present. Without it, Wi-Fi is disabled
-and the serial console still works. Arduino uses this header at compile time;
-it does not load a `.env` file at runtime.
-
-Upload the sketch and check the serial monitor for the board's IP address, then
-open `http://<board-ip>/` on your phone or browser.
-
-The page accepts the same commands as the serial shell. Commands can also be
-submitted directly with an HTTP POST:
-
-```bash
-curl --data-urlencode "command=read 4" http://<board-ip>/api/command
-```
-
-The endpoint accepts a form field named `command` and returns command output as
-plain text. The web interface has no authentication; use it only on a trusted
-Wi-Fi network and do not expose it to the public internet. Do not commit real
-Wi-Fi credentials to a shared repository.
-Ignoring a file does not remove credentials from earlier commits. If credentials
-have already been committed or shared, change the Wi-Fi password; removing them
-from Git history is a separate operation. Credentials are also embedded in the
-compiled firmware, so keep builds containing them private.
-
-The page has one editable command field with suggestions for common GPIO
-commands. Successfully run commands are saved in a newest-first history on that
-browser (up to 12 commands), so they can be selected and run again. The
-running-jobs list refreshes every three seconds and provides a Kill button for
-each job.
-
-Command names are case-insensitive, including pipeline sources and stages. For
-example, `READ 4`, `NOT 0`, and `CLOCK 100 | WRITE 5` work the same as their
-lowercase forms.
-
-## Web request troubleshooting
-
-Web requests are serialized and time out after ten seconds. A timed-out command
-may already have executed; it is not automatically retried. A failed command
-does not prevent later requests. This improves recovery but does not establish
-the cause of a device lockup. If it recurs, try `status` over serial at 115200
-baud: firmware status includes uptime, free heap, Wi-Fi status and IP address;
-startup also prints the reset reason. Compare web and serial responsiveness
-before restarting the board.
-
-## Inspect the board
+Use serial at 115200 baud or open the board's reported Wi-Fi address. Paste
+multiline programs into the editor and click Run or press Ctrl/Cmd+Enter. Saved
+scripts live in that browser's local storage. A timed-out web request may already
+have executed; inspect state before retrying an action.
 
 ```text
 help
@@ -75,168 +18,211 @@ pins
 status
 ```
 
-`help` lists command syntax. `pins` lists GPIO names and identifies the UART
-pins. `status` reports uptime, free heap, Wi-Fi status, and the board's IP
-address. GPIO1 and GPIO3 are used by the serial console; GPIO0, GPIO2, and GPIO15
-affect boot mode, so preserve their required boot levels when wiring devices.
+Use `pins` to inspect availability. GPIO1/3 are reserved for UART and flash pins
+are unavailable. GPIO0/2/15 affect boot mode; preserve their required boot levels.
+Digital commands use numeric GPIOs, not `D1` labels. Use suitable resistors,
+drivers, and voltage levels for the actual circuit.
 
-## Read and write GPIO
+## An LED and an input
 
-```text
-write 4 1
-```
-
-Set GPIO4 high. With an appropriately connected LED and resistor, this can turn
-the LED on. Use `write 4 0` to set the pin low.
+With an LED and resistor on GPIO12:
 
 ```text
-write 4 1 100
+write 12 1
+sleep 100
+write 12 0
 ```
 
-Set GPIO4 high for 100 milliseconds, then return it low without blocking the
-console.
+Statements execute in order, including the cooperative wait. There is no timed
+`write` shorthand. No automatic cleanup write happens when a job ends: include
+the final level explicitly. To read a separate input circuit on GPIO14:
 
 ```text
-read 5
+read 14 | print
 ```
 
-Configure GPIO5 as an input and print its current digital level, `0` or `1`.
-
-## Connect commands with pipes
-
-A pipeline sends values from a source, through optional transforms, to a sink:
+`read` configures its pin as input. A pipe passes an event, and `print` explicitly
+observes its primary value. A read by itself does not print the reading.
 
 ```text
-read 4 | not | print
+clock 2 --dur 1000 | write 12
 ```
 
-Read GPIO4 once, invert its value (`0` becomes `1`, and `1` becomes `0`), and
-print the result. This sets GPIO4 to input mode, so use it with an input circuit
-rather than expecting it to retain a previous output setting.
+This generates a nominal 2 Hz square wave for one second. First high is due after
+250 ms; later transitions are 250 ms apart. The exact end deadline starts no new
+event. Last output is preserved; write low afterward when desired. Frequencies
+are best-effort because software, Wi-Fi, and device transfers delay servicing.
 
-```text
-clock 2 --dur 3000 | write 5
-```
+## Analog readings and decisions
 
-Generate a nominal 2 Hz square wave on GPIO5 for three seconds. A clock emits
-two alternating values per cycle, so the pin changes level about every 250 ms.
-It returns low when the pipeline finishes.
-
-```text
-clock 4 --dur 3000 | divide 2 | toggle | write 5
-```
-
-Keep every second clock event, toggle the output for each retained event, and
-write that value to GPIO5. This produces a nominal 2 Hz output from a 4 Hz
-source. Stateful transforms retain their state while the job runs.
-
-Other signal transforms include `edge`, `rising`, `falling`, `debounce`, and
-`pulse`. See the [PRD](PRD.md) for their command model; `help` gives the syntax
-implemented by the firmware.
-
-## Read an analog value
-
-```text
-adc A0
-```
-
-Read the ADC once and print its raw value from 0 to 1023. Keep the input voltage
-within the limits of your particular board and circuit.
+Keep A0 within the voltage range of your board and circuit.
 
 ```text
 adc A0 | map 0 1023 0 100 | print
 ```
 
-Scale the ADC reading to an integer from 0 to 100 and print it. This takes one
-reading per submission; it does not start a continuous ADC job.
+`map` scales the reading and truncates its final result toward zero. It does not
+clamp values. Fields let you retain both units:
 
 ```text
-adc A0 --watch | print
+adc A0 --out raw |
+    map 0 1023 0 100 --out percent |
+    write 12 $raw > 700 |
+    print "$raw counts, $percent percent"
 ```
 
-Start a background ADC job that samples every 100 ms, emits the first reading,
-then emits only changes. Use `jobs`, `kill ID`, or `reset` to manage it. ADC
-watch jobs share the eight execution slots with clocks and can also start in a
-schedule block. Sampling uses the board's loop; it does not block the console.
-
-## Display text on an LCD
-
-The LCD command supports a **16×2 HD44780 character LCD with a PCF8574 I²C
-backpack**, using the common mapping P0=RS, P1=RW, P2=Enable, P3=backlight,
-P4–P7=D4–D7. It uses Arduino's bundled `Wire` library; no extra library is needed.
-Other backpack mappings and graphical LCD controllers are not supported.
-
-Connect SDA to **GPIO4**, SCL to **GPIO5**, and share ground. Power the module
-according to its specification. If its backpack pulls SDA/SCL up to 5 V, use a
-bidirectional I²C level shifter between it and the ESP8266's 3.3 V GPIO; do not
-connect a 5 V bus directly to the ESP8266. Adjust the backpack contrast
-potentiometer if the backlight lights but characters are invisible.
+`write` uses the comparison but preserves the event containing the percentage.
+To sample in the background:
 
 ```text
-lcd print "Hello World!"
-adc A0 --watch | lcd print
+every 100 | adc A0 | print
 ```
 
-The first LCD command initializes address `0x27` automatically. If your backpack
-has another address, initialize it explicitly first (addresses are seven-bit):
+Use `jobs` and `kill ID` with the actual reported ID. Each source owns an
+independent job. `adc A0 --watch | print` instead samples every 100 ms and emits
+the first reading and changes only. Stop prior jobs before starting another
+writer on the same pin.
+
+Hysteresis keeps a shared state between two thresholds:
 
 ```text
-lcd init 0x3f
-lcd print "Hello World!"
+set enabled 0
+every 100 | adc A0 --out raw | do {
+    if $raw > 700 { set enabled 1 }
+    if $raw < 600 { set enabled 0 }
+    write 12 $enabled
+}
 ```
 
-Each print replaces the screen starting at its top-left corner. Text wraps after
-16 characters and is clipped after 32; unused cells are padded with spaces so a
-shorter number removes old digits. Double-quoted text preserves spaces, `|`,
-and braces. The escapes `\n`, `\"`, and `\\` represent a row break, a quote,
-and a backslash. LCD character ROM determines which non-ASCII characters display.
+Each body statement receives the same raw event. Global updates are visible to
+later statements, so the final write uses the current `enabled` value.
+
+## Parse data and reuse commands
 
 ```text
-lcd print "Temperature\n25 C"
-adc A0 | map 0 1023 0 100 | lcd print
-lcd clear
-schedule { 1000 { lcd print "Ready!" } }
+func notes text {
+    split " " $text | each --out note {
+        split ":" $note --out pitch,dur |
+            tone 15 --hz notehz $pitch --dur int $dur
+    }
+}
+notes "C4:200 E4:300 G4:400"
 ```
 
-`lcd print` consumes numeric pipeline values as decimal text. Its pipeline form
-accepts no literal text argument. Direct `lcd print "TEXT"`, `lcd init`, and
-`lcd clear` return `OK`; communication failures report an error. A failing LCD
-sink stops its background job. The last screen stays visible after `kill` or
-`reset`; use `lcd clear` to blank it.
+Connect a suitable buzzer circuit on GPIO15. Each note finishes before the next
+starts. `notehz` and `int` consume their arguments directly; parentheses are
+optional grouping. Function parameters are read-only, while `set` updates shared
+globals. Pure functions also process text/lists:
 
-Once initialized, GPIO4/5 are reserved for LCD I²C. LCD initialization rejects
-running or queued clock/ADC GPIO writers on those pins. Kill conflicting jobs
-before initializing the display. LCD initialization takes about 60 ms once;
-subsequent screen writes use short synchronous I²C transfers, so they can delay
-clock edges. Avoid LCD updates in high-frequency clock pipelines.
+```text
+max 5 min 10 3 | print
+split ":" "C4:E4:G4" | join $value ", " | print
+slice "é雪😀" 1 3 | print
+```
 
-The Python simulator exposes `HardwareState.lcd_lines` (two padded rows) and
-`lcd_history` for inspection. A simulated ADC watch processes supplied readings,
-suppresses consecutive duplicates, and returns; without supplied readings it
-takes one virtual sample.
+The outputs are `5`, `C4, E4, G4`, and `雪😀`. See the complete
+[notes-and-blink program](examples/notes-and-blink.cw) for independent LED work
+while a melody plays.
 
-The driver timing follows the [HD44780 datasheet](https://www.sparkfun.com/datasheets/LCD/HD44780.pdf)
-and uses the [PCF8574's 100 kHz I²C bus](https://www.nxp.com/docs/en/data-sheet/PCF8574_PCF8574A.pdf).
+## Shape signals
+
+```text
+clock 4 --dur 1000 | divide 2 | write 12
+```
+
+`divide` emits initial low, then toggles after every second input transition.
+`edge`, `rising`, and `falling` first establish a baseline and filter subsequent
+changes. `debounce 20` accepts a Boolean level after 20 stable milliseconds.
+`pulse 100` emits high immediately on any event, then low; retriggering extends
+the deadline. Pipe these transforms to explicit actions:
+
+```text
+pulse 100 | write 12
+```
+
+Pulse retains the job until the pending low continuation finishes. Canceling that
+job may leave high on the pin, so use an explicit write after cancellation when
+needed. Stateful stages inside a function initialize afresh on every call.
+
+## Use an LCD
+
+The supported LCD is a 16×2 HD44780 with a PCF8574 I2C backpack using
+P0=RS, P1=RW, P2=Enable, P3=backlight, P4–P7=data. Connect SDA to GPIO4 and SCL
+to GPIO5, sharing ground. If a backpack pulls the bus to 5 V, use a bidirectional
+level shifter; do not connect a 5 V I2C bus directly to ESP8266 GPIO. Adjust
+contrast if the backlight works but characters are invisible.
+
+```text
+lcd init 0x27
+lcd print "Commandware\nReady"
+```
+
+The default address is `0x27`; use the module's actual seven-bit address. Text
+wraps at 16 characters and clips at 32; shorter text pads old cells. Character
+ROM determines available glyphs. To show live readings:
+
+```text
+every 200 | adc A0 | lcd print
+```
+
+GPIO4/5 become reserved for I2C. Kill conflicting jobs before initialization.
+Display actions preserve the event, and `kill`/`reset` preserves the last screen.
+Use `lcd clear` to erase it. I2C operations can delay other work.
+
+## Draw on an OLED
+
+Use an SSD1306 or SH1106 128×64/128×32 I2C module, with 3.3 V bus pull-ups,
+SDA=GPIO4 and SCL=GPIO5. Select the actual controller and screen size:
+
+```text
+oled init ssd1306 --height 64
+oled print "A0 counts"
+every 200 | adc A0 | oled chart --min 0 --max 1023 --y 8 --height 56
+```
+
+Try the module's documented address, commonly `0x3c` or `0x3d`. An acknowledgment
+does not identify its controller. Initialization/clear erases contents; printing
+changes only character cells. The bundled bitmap font is ASCII. Stop a previous
+screen-update job before starting another layout. The
+[two-chart example](examples/oled-charts.cw) keeps raw and percentage fields from
+one reading. Simulation models display pixels/history, not physical I2C timing.
+
+Use filled rectangles for simple graphics. Drawing and erasing affect only the
+specified pixels, and coordinates/dimensions must be integers within the screen:
+
+```text
+oled init ssd1306
+oled rect 1 24 3 14
+oled rect 63 32 2 2
+oled rect 1 24 3 14 --value 0
+oled rect 1 22 3 14
+```
+
+The [two-player Pong example](examples/pong.cw) uses GPIO12 for the left button
+and GPIO14 for the right. Connect each button between its GPIO and GND, with a
+separate 10 kΩ external pull-up from that GPIO to 3.3 V. `read` uses plain input
+mode, so pull-ups are required. Hold a button to move its paddle up; release to
+move down. The program assumes a 128×64 OLED; change the initialization controller
+or address to match your module. Stop old jobs before running the full file in
+the web editor. Use `jobs` and `kill ID` to stop the game.
+
+Pong samples both buttons and updates the ball every 50 ms, with a short serve
+pause after each point while paddles remain movable. Scores wrap after 99. OLED
+transfers and script scheduling are best effort; simulator/native checks do not
+establish animation smoothness on the physical board.
 
 ## Measure resistance
 
-
-Run `ohm` or `ohm A0` over serial or the web console. `adc A0 | ohm` also
-works, with `ohm` as the terminal measurement stage. Numeric output is rounded
-to whole ohms. In the Python simulator, `ohm` converts incoming raw ADC values
-or reads the virtual A0 when no values are supplied.
-
-This calibration is specific to the measured circuit: 4.954 V through 20,160 Ω
-to A0, with 3,357 Ω and the unknown resistor in parallel from A0 to ground.
-ADC counts are interpolated linearly to measured node voltage. Between adjacent
-measured voltage/resistance pairs, resistance follows a piecewise exponential
-function, with voltage in millivolts and resistance in ohms:
-
 ```text
-R(v) = Ri * exp(((v - vi) / (vi+1 - vi)) * log(Ri+1 / Ri))
+adc A0 | ohm | print
 ```
 
-| Known resistor (Ω) | Raw A0 | Node voltage (mV) |
+This calibration is specific to a measured circuit: 4.954 V through 20,160 Ω to
+A0, with 3,357 Ω and the unknown resistor in parallel from A0 to ground. Changing
+the supply, divider, or A0 circuitry requires new calibration. `ohm` transforms
+an integer count; it does not read A0 or print implicitly.
+
+| Resistor (Ω) | Raw A0 | Node voltage (mV) |
 | --- | --- | --- |
 | 270 | 50 | 60 |
 | 995 | 179 | 181 |
@@ -247,242 +233,88 @@ R(v) = Ri * exp(((v - vi) / (vi+1 - vi)) * log(Ri+1 / Ri))
 | 108800 | 703 | 682 |
 | 688900 | 720 | 697 |
 
-The function passes through all eight measurements and follows the connecting
-lines on the logarithmic resistance chart. Numeric output is accepted for A0
-counts 30–720, including both endpoints (approximately 41.2403–697 mV).
-Counts 30–49 extrapolate the first measured segment, giving approximately
-221–267 Ω; this extension is uncalibrated. Counts below 30 report `<270`;
-counts above 720 report `>700k`. The upper label is approximate: the last
-measured resistance is 688,900 Ω, and no extrapolation to 700,000 Ω is performed.
-Counts outside the valid ADC range 0–1023 report `OUT_OF_RANGE`.
+Counts map linearly to measured voltage, then exponentially between adjacent
+resistance measurements. Counts 30–720 return whole ohms. Counts 30–49 extrapolate
+the first segment and are uncalibrated. Lower counts return `<270`; higher counts
+return `>700k`; counts outside 0–1023 return `OUT_OF_RANGE`. The upper label is
+approximate; the final measured resistance is 688,900 Ω. Interpolation does not
+establish accuracy between measurements.
 
-Python also provides `resistance_from_voltage(v_mv)` for measured millivolts,
-with the same bounds and whole-ohm output. Interpolation does not establish
-accuracy between measurements, particularly near the high-resistance plateau.
-Changing the supply, divider, or A0 input circuitry requires new calibration.
-
-## Shift data
+## Shift one hardware frame
 
 ```text
-shiftout 5 4 14 msb 170
+shiftout 12 13 14 msb --value 170 --bits 8
+shiftin 12 13 14 msb --bits 8 | print
 ```
 
-Send the eight-bit value 170 (`10101010`) to a shift register using GPIO5 for
-data, GPIO4 for clock, and GPIO14 for latch, most significant bit first.
+Run these separately with suitable output/input-register circuits. Pins are data,
+clock, and latch/load. Width defaults to 8; `--bits` permits 1–53 exactly
+representable bits. `shiftout` preserves the event; `shiftin` replaces its value.
+Input samples the first bit before the first clock pulse. For output without a
+latch, use `shiftout 12 13 msb --value 170 --bits 8`. Bit order can be `lsb`.
+Verify register load/latch polarity and clock timing on the actual circuit.
 
-```text
-shiftin 12 4 14 msb 8
-```
-
-Read eight bits from a compatible input shift register, most significant bit
-first, using GPIO12 for data, GPIO4 for clock, and GPIO14 for load. Print the
-resulting integer. These examples assume the corresponding register is wired
-to the named pins.
-
-## Manage background jobs
-
-```text
-clock 2 | write 5
-```
-
-Start an unlimited clock job. The console returns a job ID and remains
-responsive while GPIO5 toggles.
-
-```text
-jobs
-```
-
-List running clocks and queued schedule entries. Queued entries are marked
-`[queued]` and retain their IDs when they start.
-
-```text
-kill 1
-```
-
-Cancel job 1; replace `1` with the ID reported by your board. Killing a running
-clock returns its output pins low. Killing a queued entry prevents it starting.
-Use `reset` to stop all clock jobs and clear the schedule queue.
-
-## Timed clocks and scheduling
-
-`clock HZ [PIN] [--dur MILLISECONDS]` accepts frequencies from 0.01 to
-1,000,000 Hz. This is an accepted input range, not a guarantee of achievable
-GPIO frequency: loop, Wi-Fi, and software GPIO overhead limit actual timing.
-
-
-Clocks run indefinitely by default. Add `--dur` to stop a clock after a given
-number of milliseconds, including any downstream pipeline stages:
-
-```text
-clock 1000 --dur 500 | write 15
-```
-
-This plays a nominal 1000 Hz tone for 500 ms. Completion, `kill ID`, and `reset`
-drive the clock's output pins low. The existing shorthand also accepts a
-duration: `clock 1000 15 --dur 500`. Without a write or print sink, a clock prints
-its values to serial.
-
-Use a schedule block to start commands on one shared timeline:
+## Start work on a timeline
 
 ```text
 schedule {
-    1000 { clock 1000 --dur 500 | write 15 }
-    1500 { clock 1400 --dur 1000 | write 15 }
+    0 { tone 15 --hz notehz "C4" --dur 200 }
+    250 { tone 15 --hz notehz "C4" --dur 200 }
+    500 { tone 15 --hz notehz "D4" --dur 450 }
+    1000 { tone 15 --hz notehz "C4" --dur 450 }
+    1500 { tone 15 --hz notehz "F4" --dur 450 }
+    2000 { tone 15 --hz notehz "E4" --dur 900 }
 }
 ```
 
-The timeline starts after the complete block is accepted. Each number is a
-start offset in milliseconds. The first note starts at 1000 ms and finishes at
-1500 ms; the second starts at 1500 ms and finishes at 2500 ms. Entries may be
-written in any order. Different pins can run concurrently; overlapping clock
-writes to the same pin are rejected before any entries are queued. At a shared
-boundary, expired clocks stop before the next clocks start.
-
-Paste the block into the multiline web command field, or send it over serial;
-serial waits for the outer closing brace and a newline before submitting it.
-Single-line blocks work too. Immediate commands such as `1000 { write 4 1 }`
-run once at their scheduled time. Administrative commands (`kill`, `reset`,
-`jobs`) and nested schedules are not allowed inside a block.
-
-The firmware queues up to 32 future entries separately from its eight running
-clock slots. A future note only takes an execution slot when it starts, so a
-whole melody can fit in one block. `jobs` lists both queued and running entries
-with stable job IDs, and `kill ID` cancels either. Blocks that overflow the
-queue or would require more than eight concurrent clocks are rejected as a
-whole. New clocks are also checked against already queued notes.
-Offsets are integers from 0 to 2,147,483,647 ms; durations are integers from 1
-to 2,147,483,647 ms, and offset plus duration must fit that same maximum.
-Timing is serviced by the device loop rather than by delays on the computer;
-Wi-Fi and loop overhead can still delay signal edges.
-
-The Python simulator evaluates schedules on a virtual timeline without waiting
-in real time. Finite clocks produce samples until their duration ends and then
-release their output pins. Unlimited clocks retain bounded simulation sampling
-(one sample by default, or `run_stream(..., count=N)`), while firmware clocks
-remain active indefinitely. The simulator does not model GPIO or network timing
-accuracy.
-
-Verify changes with `python -m pytest` and `node tests/web_request.test.cjs`.
-On Windows with Visual Studio Community C++ tools installed,
-`python tests/run_firmware_tests.py` runs the actual firmware parser, scheduler,
-and serial loop against a simulated clock and GPIO without a connected board.
-
-## Try the Python simulator
-
-The simulator provides virtual GPIO and evaluates streams without a board.
-From the repository root in Bash:
-
-```bash
-PYTHONPATH=src python -m commandware clock 10
-echo 5 | PYTHONPATH=src python -m commandware map 0 10 0 100
-echo 0 | PYTHONPATH=src python -m commandware not
-```
-
-The first command returns a bounded clock sample rather than running forever.
-The second maps `5` to `50`; the third inverts `0` to `1`. Simulator timing is
-virtual and does not predict the board's electrical behavior.
-
-## Display text and charts on an OLED
-
-IIC is another label for I2C. This command supports SSD1306 and SH1106 modules
-with 128x64 or 128x32 screens; it does not automatically identify the controller.
-Wire SDA to GPIO4 and SCL to GPIO5, share ground, and power the module according
-to its specification. Keep the I2C pull-ups at 3.3 V for the ESP8266.
-
-Start with:
-
-```text
-oled init ssd1306
-oled print "Hello"
-oled print 2 16 "Commandware"
-```
-
-If the image is blank or shifted, try `oled init sh1106` and print again. An
-I2C communication error points to wiring/power/address rather than controller
-identification; a device acknowledging an address does not identify its model.
-Try `--address 0x3d` if your module uses that address. For a 128x32 screen, add
-`--height 32` to initialization. Both controller choices use the same drawing
-commands. Initialization clears previous text and charts.
-
-Coordinates default to `(0,0)`. These two forms place text at pixel `(2,2)`:
-
-```text
-oled print 2 2 "hello"
-oled print "hello" --x 2 --y 2
-```
-
-Text updates only its character cells. Use `oled clear` to erase everything,
-including traces, before drawing a new layout. Pipeline values work too:
-
-```text
-every 200 | adc A0 | oled print
-```
-
-Kill that job before starting another screen layout. For a voltage trace:
-
-```text
-do {
-    oled init ssd1306
-    oled print "A0 counts"
-    every 200 | adc A0 | oled chart --min 0 --max 1023 --y 8 --height 56
-}
-```
-
-Each reading advances the trace one pixel. Change the min/max values to match
-your units. You can put independent traces in separate rectangles; the
-[two-chart example](examples/oled-charts.cw) shows raw counts and percent from
-the same ADC reading, without requiring extra sensor hardware. It is a layout
-example, not a temperature/humidity driver.
-
-The screen refreshes in short transactions between device-loop iterations.
-`reset`/`kill` preserve the last screen; `oled clear` erases it. GPIO4/5 remain
-reserved for the display bus. Communication failures include a line number;
-after a failed transfer, fix the connection and run `oled init` again.
-
-The controller command implementations follow the
-[SSD1306 datasheet](https://www.olimex.com/Products/Modules/LCD/MOD-OLED-128x64/resources/SSD1306.pdf)
-and [SH1106 datasheet](https://community.nxp.com/pwmxy87654/attachments/pwmxy87654/kinetis/46518/1/SH1106%20datasheet.pdf).
-The bundled ASCII bitmap font is derived from
-[Adafruit GFX](https://github.com/adafruit/Adafruit-GFX-Library/blob/master/glcdfont.c);
-its BSD license is included beside the driver and simulator.
+This plays the first Happy Birthday phrase. Offsets are milliseconds from one
+registration timeline, evaluated once. Each entry gets its own job and reads
+live globals. There are 32 pending entries and eight active execution slots.
+An entry can fail at execution for unavailable resources; independent entries
+continue. Registration does not wait or emit an event. `reset` cancels queued and
+active work, clears globals/failures, and preserves pin/display state and function
+definitions. No command automatically drives a pin low at completion.
 
 ## Happy Birthday
 
-With a buzzer connected to GPIO15, paste this entire block into the web command
-field and click **Run**, or send it over serial followed by a newline. It plays
-all four phrases automatically in about 12.5 seconds, using 25 queued entries.
-To use another GPIO, replace every `write 15` with your buzzer's pin number.
-
-Frequencies are in hertz; start offsets and durations are in milliseconds.
-The short gaps make repeated notes distinct. Each note returns the output low
-when it finishes, and the next note starts from the same shared timeline.
+This complete 25-note melody preserves the shared timeline's note durations and
+short gaps, finishing in about 12.4 seconds. A reusable command function makes
+those gaps explicit instead of relying on cleanup writes or implicit pauses.
+Each token is `NOTE:DURATION_MS:GAP_MS`. With a suitable buzzer circuit on GPIO15,
+paste the whole program into the console:
 
 ```text
-schedule {
-    0     { clock 262 --dur 200 | write 15 }
-    250   { clock 262 --dur 200 | write 15 }
-    500   { clock 294 --dur 450 | write 15 }
-    1000  { clock 262 --dur 450 | write 15 }
-    1500  { clock 349 --dur 450 | write 15 }
-    2000  { clock 330 --dur 900 | write 15 }
-    3000  { clock 262 --dur 200 | write 15 }
-    3250  { clock 262 --dur 200 | write 15 }
-    3500  { clock 294 --dur 450 | write 15 }
-    4000  { clock 262 --dur 450 | write 15 }
-    4500  { clock 392 --dur 450 | write 15 }
-    5000  { clock 349 --dur 900 | write 15 }
-    6000  { clock 262 --dur 200 | write 15 }
-    6250  { clock 262 --dur 200 | write 15 }
-    6500  { clock 523 --dur 450 | write 15 }
-    7000  { clock 440 --dur 450 | write 15 }
-    7500  { clock 349 --dur 450 | write 15 }
-    8000  { clock 330 --dur 450 | write 15 }
-    8500  { clock 294 --dur 900 | write 15 }
-    9500  { clock 466 --dur 200 | write 15 }
-    9750  { clock 466 --dur 200 | write 15 }
-    10000 { clock 440 --dur 450 | write 15 }
-    10500 { clock 349 --dur 450 | write 15 }
-    11000 { clock 392 --dur 450 | write 15 }
-    11500 { clock 349 --dur 900 | write 15 }
+func birthday score {
+    split " " $score | each --out entry {
+        split ":" $entry --out pitch,duration,gap | do {
+            tone 15 --hz notehz $pitch --dur int $duration
+            write 15 0
+            sleep int $gap
+        }
+    }
 }
+birthday "C4:200:50 C4:200:50 D4:450:50 C4:450:50 F4:450:50 E4:900:100 C4:200:50 C4:200:50 D4:450:50 C4:450:50 G4:450:50 F4:900:100 C4:200:50 C4:200:50 C5:450:50 A4:450:50 F4:450:50 E4:450:50 D4:900:100 Bb4:200:50 Bb4:200:50 A4:450:50 F4:450:50 G4:450:50 F4:900:0"
 ```
+
+Replace both occurrences of GPIO15 when using another pin. The explicit low
+write makes each inter-note gap silent and leaves the buzzer low after completion.
+Finite statements execute in order, so the melody needs one active job rather
+than 25 queued entries. Timing remains best-effort on the physical board.
+
+## Try programs without a board
+
+From the repository root:
+
+```bash
+PYTHONPATH=src python -m commandware 'max 5 min 10 3 | print'
+PYTHONPATH=src python -m commandware 'adc A0 | map 0 1023 0 100 | print'
+```
+
+The simulator advances virtual time and bounds unlimited source samples. For
+manual stepping use `ScriptRuntime.submit` and increasing `tick` timestamps.
+Check `HardwareState.script_writes`, `tone_history`, and display history to inspect
+simulated behavior. Simulation cannot validate wiring or physical waveform fidelity.
+
+Run `python -m pytest`, `python tests/run_firmware_tests.py`, and
+`node tests/web_request.test.cjs` for software checks. Board checks still include
+GPIO ownership, pulse/tone timing under Wi-Fi load, I2C recovery, and peak heap.

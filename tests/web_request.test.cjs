@@ -15,24 +15,29 @@ function client(fetch) {
     setTimeout: (callback, delay) => { assert.equal(delay, 10000); timers.set(++id, callback); return id; },
     clearTimeout: key => timers.delete(key)});
   vm.runInContext(transport, context);
-  return {send: context.send, timers};
+  return {send: context.send, getJobs: context.getJobs, timers};
 }
 
 test('commands and jobs polling share one request at a time', async () => {
   const calls = [];
   let completeFirst;
-  const c = client(async (_, options) => {
-    calls.push(options.body.get('command'));
+  const c = client(async (url, options) => {
+    calls.push(options.body ? options.body.get('command') : url);
+    if (url === '/api/jobs') {
+      assert.equal(options.method, 'GET');
+      assert.equal(options.cache, 'no-store');
+      assert.equal(options.body, undefined);
+    }
     if (calls.length === 1) return new Promise(resolve => {completeFirst = resolve});
     return response('second');
   });
-  const first = c.send('ohm A0'), second = c.send('jobs');
+  const first = c.send('ohm A0'), second = c.getJobs();
   await Promise.resolve();
   assert.deepEqual(calls, ['ohm A0']);
   completeFirst(response('9878'));
   assert.equal(await first, '9878');
   assert.equal(await second, 'second');
-  assert.deepEqual(calls, ['ohm A0', 'jobs']);
+  assert.deepEqual(calls, ['ohm A0', '/api/jobs']);
   assert.equal(c.timers.size, 0);
 });
 
@@ -85,7 +90,7 @@ test('jobs view retains background failures with error text and no Kill button',
     createTextNode(text) {return {text};}
   };
   let jobs = "3 FAILED  every 500: unknown name 'missing' at line 3\n4 RUNNING  every 100";
-  const context = vm.createContext({document, j, r: {}, busy: false, send: async () => jobs});
+  const context = vm.createContext({document, j, r: {}, busy: false, getJobs: async () => jobs});
   const refresh = sketch.slice(sketch.indexOf('async function refresh()'), sketch.indexOf('    a.onclick='));
   vm.runInContext(refresh, context);
   await context.refresh();

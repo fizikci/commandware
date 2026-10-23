@@ -86,24 +86,38 @@ struct FakeWire {
 } Wire;
 struct { int getFreeHeap() { return 10000; } } ESP;
 struct { int status() { return 3; } String localIP() { return "127.0.0.1"; } } WiFi;
-struct Job;
 static void handleCommand(const String &line, uint16_t sourceLine = 1);
+static bool scriptRequest(const String &, const String *, String &);
 void serviceWebServer() {}
 void yield() {}
 #include "scheduler-under-test.inc"
+
+enum { HTTP_GET, HTTP_POST };
+static const char WEB_PAGE[] = "";
+struct FakeWebServer {
+    std::map<std::pair<std::string, int>, std::function<void()>> handlers;
+    int status = 0;
+    std::string body, cacheControl;
+    void on(const char *path, int method, std::function<void()> handler) { handlers[{path, method}] = handler; }
+    void onNotFound(std::function<void()>) {}
+    std::map<std::string, std::string> arguments;
+    String arg(const char *name) { auto found=arguments.find(name); return found==arguments.end() ? String() : String(found->second); }
+    bool hasArg(const char *name) { return arguments.count(name); }
+    void send(int code, const char *, const String &text) { status = code; body = text.c_str(); }
+    void send_P(int code, const char *type, const char *text) { send(code, type, text); }
+    void sendHeader(const char *name, const char *value) { if (std::string(name) == "Cache-Control") cacheControl = value; }
+} webServer;
+#include "web-under-test.inc"
 
 void fresh(uint64_t timeUs = 0) {
     oledDisplay = cw::OledDisplay();
     configureScriptRuntime();
     scriptRuntime.reset(); scriptRuntime.functions.clear();
     scriptPinOwners.clear(); scriptOutputPins.clear();
-    for (auto &job : jobs) job = Job();
-    for (auto &entry : scheduled) entry = ScheduledCommand();
     nextJobId = 1;
     fakeUs = timeUs;
     gpio.clear(); writes.clear(); delays.clear();
     Serial.output.str(""); Serial.output.clear();
-    pendingWritePulse = PendingWritePulse();
     Serial.input.clear(); Serial.position = 0;
     inputBuffer = ""; inputBraceDepth = 0;
     inputQuoted = inputEscaped = false;
@@ -111,10 +125,10 @@ void fresh(uint64_t timeUs = 0) {
     inputAfterCR = false; inputLine = 1;
     lcdReady = false; lcdAddress = 0x27; Wire = FakeWire(); adcValue = 512;
 }
-int activeJobs() { int count = 0; for (const auto &job : jobs) count += job.active; return count; }
-int queuedJobs() { int count = 0; for (const auto &entry : scheduled) count += entry.id != 0; return count; }
+int activeJobs() { int count = 0; for (const auto &task : scriptRuntime.tasks) count += !task->scheduled; return count; }
+int queuedJobs() { int count = 0; for (const auto &task : scriptRuntime.tasks) count += task->scheduled; return count; }
 int totalJobs() { return activeJobs() + queuedJobs(); }
-void at(uint64_t us) { fakeUs = us; serviceJobs(); scriptRuntime.tick((uint32_t)millis(), (uint32_t)micros()); }
+void at(uint64_t us) { fakeUs = us; scriptRuntime.tick((uint32_t)millis(), (uint32_t)micros()); }
 void rejected(const char *command) {
     fresh(); handleCommand(command);
     assert(totalJobs() == 0);
@@ -123,372 +137,148 @@ void rejected(const char *command) {
 }
 
 int main(int argc, char **argv) {
-    fresh(); handleCommand("lcd print \"Hello | World!\"");
-    assert(lcdReady && Wire.sda == 4 && Wire.scl == 5 && Wire.address == 0x27);
-    // Decode the real driver's RS data writes, including padding on both rows.
-    std::string displayed;
-    for (size_t i = 0; i + 5 < Wire.bytes.size(); i += 3)
-        if (Wire.bytes[i] & 1) {
-            displayed += char((Wire.bytes[i] & 0xf0) | (Wire.bytes[i + 3] >> 4));
-            i += 3;
-        }
-    assert(displayed == "Hello | World!                  ");
-    handleCommand("write 4 1"); assert(writes.empty());
-    Wire.bytes.clear(); handleCommand("adc A0 | lcd print");
-    assert(Serial.output.str().find("pipeline stage failure") == std::string::npos);
-    assert(Wire.bytes.size() == 34 * 6);
+    fresh(); configureWebServer();
+    assert(scriptStorage.begin());
+    handleCommand("status");
+    assert(Serial.output.str().find("LittleFS ready; used bytes:")!=std::string::npos);
+    LittleFS.mountFails=true;assert(!scriptStorage.begin());
+    Serial.output.str("");handleCommand("status");
+    assert(Serial.output.str().find("mount failed")!=std::string::npos);
+    assert(Serial.output.str().find("Filesystem was not formatted")!=std::string::npos);
+    assert(LittleFS.formatCalls==0);
+    LittleFS.mountFails=false;assert(scriptStorage.begin());fresh();
+    auto scriptApi = webServer.handlers.at({"/api/command", HTTP_POST});
+    webServer.arguments = {{"command", "script save demo"}, {"result", "script"}, {"source", "  print \"$literal é雪\"\n\n"}};
+    scriptApi();
+    assert(webServer.status == 200 && webServer.body.find("\"ok\":true") != std::string::npos);
+    assert(LittleFS.files.at("/scripts/demo.cw") == "  print \"$literal é雪\"\n\n");
+    webServer.arguments = {{"command", "script load demo"}, {"result", "script"}};
+    scriptApi();
+    assert(webServer.status == 200 && webServer.body == "{\"ok\":true,\"value\":\"  print \\\"$literal é雪\\\"\\u000a\\u000a\"}");
+    webServer.arguments["command"] = "script list";scriptApi();
+    assert(webServer.body == "{\"ok\":true,\"value\":[\"demo\"]}");
+    webServer.arguments["command"] = "script delete demo";scriptApi();
+    assert(webServer.status == 200 && !LittleFS.exists("/scripts/demo.cw"));
+    scriptApi();assert(webServer.status == 400);
+    webServer.arguments["command"] = "script list; print 123";scriptApi();
+    assert(webServer.status == 400);
+    webServer.arguments = {{"command", "script save full"}, {"result", "script"}, {"source", std::string(4096, 'x')}};
+    scriptApi();assert(webServer.status == 200);
+    webServer.arguments["command"] = "script load full";webServer.arguments.erase("source");
+    scriptApi();assert(webServer.status == 200 && webServer.body.size() > 4096);
+    webServer.arguments = {{"command", "script save full"}, {"result", "script"}, {"source", std::string(4097, 'x')}};
+    scriptApi();assert(webServer.status == 400 && LittleFS.files.at("/scripts/full.cw").size() == 4096);
+    webServer.arguments.clear();LittleFS.files.clear();fresh();
+    auto pollJobs = webServer.handlers.at({"/api/jobs", HTTP_GET});
+    for (int i = 0; i < 3; ++i) {
+        pollJobs();
+        assert(webServer.status == 200 && webServer.body.empty());
+        assert(webServer.cacheControl == "no-store");
+        assert(nextJobId == 1 && totalJobs() == 0 && commandOutput == &Serial);
+    }
+    handleCommand("every 100 | print");
+    handleCommand("print $missing");
+    auto idBeforePolling = nextJobId;
+    auto jobsBeforePolling = totalJobs();
+    for (int i = 0; i < 3; ++i) {
+        pollJobs();
+        assert(webServer.body.find("RUNNING  every\n") != std::string::npos);
+        assert(webServer.body.find("FAILED  script:") != std::string::npos);
+        assert(webServer.body.find("RUNNING  script") == std::string::npos);
+        assert(nextJobId == idBeforePolling && totalJobs() == jobsBeforePolling);
+        assert(commandOutput == &Serial);
+    }
+    fresh(); handleCommand("write 12 1");
+    assert(gpio[12] == HIGH && scriptPinOwners.empty());
+    handleCommand("reset"); assert(gpio[12] == HIGH);
+    handleCommand("number 512 --out raw | write 12 $raw > 700 | print $raw | print");
+    assert(gpio[12] == LOW && Serial.output.str().find("512\n512\n") != std::string::npos);
+    handleCommand("map 0 10 (-100) 100 2.5 | print");
+    assert(Serial.output.str().find("-50\n") != std::string::npos);
+    fresh(); handleCommand("func Pair text { split \":\" $text }; Pair --text \"A:B\" --out a,b | print \"$a/$b\"");
+    assert(Serial.output.str().find("A/B\n") != std::string::npos);
+    handleCommand("number 9 | do { number 1; number 2 } | print");
+    assert(Serial.output.str().find("2\n") != std::string::npos);
+    handleCommand("number 9 | if 0 {} else { number 3 } | print");
+    assert(Serial.output.str().find("3\n") != std::string::npos);
+    handleCommand("split \":\" \"a:b\" | each { print } | len $value | print");
+    assert(Serial.output.str().find("a\nb\n2\n") != std::string::npos);
+    handleCommand("max 5 min 10 3 | print");
+    assert(Serial.output.str().find("5\n") != std::string::npos);
+    std::cout << "PASS unified command routing, values, direct functions, branches, blocks and iteration\n";
 
-    fresh(); handleCommand("lcd init 0x3f"); assert(lcdAddress == 0x3f && lcdReady);
-    handleCommand("lcd clear");
-    fresh(); Wire.error = 2; handleCommand("lcd print \"Hello\"");
-    assert(!lcdReady && Serial.output.str().find("ERROR:") != std::string::npos);
-    for (const char *invalid : {"lcd print", "lcd print \"oops", "lcd print \"ok\" extra", "lcd init 0", "lcd init 0x27 junk", "adc A0 --watch extra | lcd print"})
-        rejected(invalid);
-
-    fresh(); handleCommand("adc A0 --watch | lcd print");
-    assert(activeJobs() == 1); at(0); assert(lcdReady);
-    size_t written = Wire.bytes.size();
-    at(100000); assert(Wire.bytes.size() == written); // Unchanged ADC suppressed.
-    adcValue = 7; at(200000); assert(Wire.bytes.size() == written + 34 * 6);
-    handleCommand("jobs"); assert(Serial.output.str().find("1 RUNNING  adc A0 --watch") != std::string::npos);
-    handleCommand("kill 1"); adcValue = 8; at(300000); assert(!activeJobs());
-    assert(Wire.bytes.size() == written + 34 * 6);
-    fresh(); handleCommand("adc A0 --watch | print"); at(0); at(100000);
-    adcValue = 1; at(200000); handleCommand("reset"); assert(!activeJobs());
-    assert(Serial.output.str().find("512\n1\n") != std::string::npos);
-    fresh(); handleCommand("clock 1 | write 4"); handleCommand("lcd init");
-    assert(!lcdReady && activeJobs() == 1);
-    fresh(); handleCommand("schedule { 0 { lcd print \"a|{b}\" } }");
-    assert(queuedJobs() == 1); at(0); assert(lcdReady);
-    fresh(); Serial.input = "lcd print \"{Hello}\"\n"; loop(); assert(lcdReady);
-
-    fresh();
-    Serial.input = "schedule {\n 1000 {clock 1000 --dur 500 | write 15}\n";
-    loop(); assert(!activeJobs());
-    Serial.input += " 1500 {clock 1400 --dur 1000 | write 15}\n}\n";
-    loop(); assert(totalJobs() == 2);
-    at(999000); assert(writes.empty());
-    at(1000000); at(1000500); assert(gpio[15] == HIGH);
-    at(1500000); assert(jobs[0].id == 2 && jobs[0].started);
-    at(2500000); assert(!totalJobs() && gpio[15] == LOW);
-
-    fresh();
-    handleCommand("clock 1000 --dur 2 | write 15");
-    at(0); at(500); assert(gpio[15] == HIGH);
+    fresh(); handleCommand("clock 1000 --dur 2 | write 15");
+    at(0); assert(writes.empty());
+    at(500); assert(gpio[15] == HIGH);
     at(1000); assert(gpio[15] == LOW);
     at(1500); assert(gpio[15] == HIGH);
-    at(2000); assert(gpio[15] == LOW && activeJobs() == 0);
-
-    fresh(); handleCommand("clock 1000 15 --dur 2");
-    at(0); at(500); assert(gpio[15] == HIGH); // Legacy pin shorthand.
-    handleCommand("kill 1"); assert(gpio[15] == LOW && !activeJobs());
-
-    fresh(); handleCommand("clock 1000 | write 15");
-    at(0); at(500); at(2000000); assert(activeJobs() == 1);
-    handleCommand("reset"); assert(gpio[15] == LOW && !activeJobs());
-
-    fresh();
-    handleCommand("SCHEDULE {\n 2 { CLOCK 1000 --dur 1 | WRITE 15 }\n 0 { clock 1000 --dur 2 | write 15 }\n 0 { clock 1000 --dur 1 | write 5 }\n}");
-    assert(queuedJobs() == 3 && !activeJobs());
-    at(0); at(500); assert(gpio[15] == HIGH && gpio[5] == HIGH);
-    at(1000); assert(activeJobs() == 1 && gpio[5] == LOW);
-    at(1500); assert(gpio[15] == HIGH);
-    at(2000); assert(jobs[0].id == 1 && jobs[0].started && gpio[15] == LOW);
-    at(2500); assert(gpio[15] == HIGH);
-    at(3000); assert(!totalJobs() && gpio[15] == LOW);
-
-    fresh(); handleCommand("schedule { 1000 { clock 1000 --dur 500 | write 15 } }");
-    handleCommand("kill 1"); at(2000000); assert(writes.empty());
-
-    fresh(); handleCommand("schedule { 2 { write 15 0 } 1 { write 15 1 } }");
-    at(0); assert(writes.empty()); at(1000); assert(gpio[15] == HIGH);
-    at(2000); assert(gpio[15] == LOW && !totalJobs());
-
-    const uint64_t base = 4294967294ULL * 1000;
-    fresh(base); handleCommand("schedule { 1 { clock 1000 --dur 2 | write 15 } }");
-    at(base); assert(writes.empty()); at(base + 1000); at(base + 1500);
-    assert(gpio[15] == HIGH);
-    at(base + 3000); assert(gpio[15] == LOW && !totalJobs());
-
-    for (const char *invalid : {
-        "clock 1000 --dur 0 | write 15", "clock 1000 --dur -1 | write 15",
-        "clock 1000 --dur 1.5 | write 15", "clock 1000 --dur | write 15",
-        "clock 1000 --dur 2147483648 | write 15", "clock nan | write 15",
-        "clock 1000junk | write 15", "clock 1000 --dur 2 --dur 3 | write 15",
-        "clock 1000 |", "schedule {}", "schedule { 0 {} }",
-        "schedule { -1 { clock 1000 | write 15 } }",
-        "schedule { 0 { clock 1000 | write 15 } } trailing",
-        "schedule { 0 { clock 1000 | write 15 }",
-        "schedule { 0 { clock 1000 --dur 5 | write 15 } 4 { clock 1000 --dur 5 | write 15 } }",
-        "schedule { 2147483647 { clock 1000 --dur 1 | write 15 } }",
-        "schedule { 0 { read 4 | bogus } }"
-    }) rejected(invalid);
-
-    fresh(); handleCommand("clock 1000 | write 15");
-    handleCommand("schedule { 1 { clock 1000 --dur 2 | write 15 } }");
-    assert(totalJobs() == 1);
-
-    fresh();
-    for (int i = 0; i < 8; ++i) handleCommand("clock 1000 | print");
-    handleCommand("schedule { 0 { clock 1000 --dur 1 | print } }");
-    assert(totalJobs() == 8);
-
-    fresh();
-    for (int i = 0; i < 8; ++i) handleCommand("clock 1000 --dur 10 | print");
-    handleCommand("schedule { 20 { clock 1000 --dur 1 | write 15 } }");
-    assert(activeJobs() == 8 && queuedJobs() == 1);
-    at(0); at(10000); assert(!activeJobs() && queuedJobs() == 1);
-    at(20000); at(20500); assert(activeJobs() == 1 && gpio[15] == HIGH);
-    at(21000); assert(!totalJobs() && gpio[15] == LOW);
-
-    fresh();
-    handleCommand("schedule { 100 { clock 1000 --dur 1 | write 15 } }");
-    handleCommand("clock 1000 | write 15");
-    assert(!activeJobs() && queuedJobs() == 1); // Direct clocks respect future notes.
-
-    fresh();
-    std::string sequence = "schedule {";
-    for (int i = 0; i < 32; ++i)
-        sequence += std::to_string(i) + " { clock 1000 --dur 1 | write 15 } ";
-    sequence += "}";
-    handleCommand(sequence);
-    assert(queuedJobs() == 32 && !activeJobs());
-    handleCommand("schedule { 100 { print 1 } }");
-    assert(queuedJobs() == 32); // Queue overflow is atomic.
-    handleCommand("jobs");
-    assert(Serial.output.str().find("32 RUNNING  [queued]") != std::string::npos);
-    handleCommand("kill 25");
-    assert(queuedJobs() == 31);
-    for (uint64_t us = 0; us <= 32000; us += 500) { at(us); assert(activeJobs() <= 1); }
-    assert(!totalJobs() && gpio[15] == LOW);
-
-    fresh();
-    sequence = "schedule {";
-    for (int i = 0; i < 9; ++i) sequence += "0 { clock 1000 --dur 1 | print } ";
-    sequence += "}";
-    rejected(sequence.c_str());
-    handleCommand("schedule { 100 { clock 1000 --dur 1 | write 15 } }");
+    at(2000); assert(gpio[15] == HIGH && !totalJobs() && scriptPinOwners.empty());
+    fresh(); handleCommand("every 10 | write 12 1"); at(0);
+    assert(gpio[12] == HIGH && totalJobs() == 1);
+    handleCommand("write 12 0"); assert(gpio[12] == HIGH && !scriptRuntime.failures.empty());
+    handleCommand("reset"); assert(gpio[12] == HIGH && !totalJobs());
+    fresh(); handleCommand("set n 1; schedule { 5 { print $n } }; set n 2");
+    assert(queuedJobs() == 1); at(5000);
+    assert(Serial.output.str().find("2\n") != std::string::npos);
+    fresh(); handleCommand("func F p { schedule { 5 { print $p } } }; F 7"); at(5000);
+    assert(Serial.output.str().find("7\n") != std::string::npos);
+    fresh(); handleCommand("clock 100 --dur 25 | print"); at(5000); at(16000); at(20000); at(25000);
+    assert(Serial.output.str().find("1\n0\n") != std::string::npos);
+    fresh(); handleCommand("pulse 10 | write 12"); assert(gpio[12] == HIGH); at(10000);
+    assert(gpio[12] == LOW && !totalJobs());
+    fresh(); handleCommand("every 5 | pulse 10 | write 12"); at(0); at(5000); at(10000);
+    assert(gpio[12] == HIGH); handleCommand("reset"); assert(gpio[12] == HIGH);
+    fresh(); gpio[12] = HIGH; handleCommand("every 5 | read 12 | debounce 10 | print");
+    at(0); at(5000); at(10000); assert(Serial.output.str().find("1\n") != std::string::npos);
     handleCommand("reset");
-    at(101000); assert(!totalJobs() && writes.empty());
+    fresh(); handleCommand("clock 100 --dur 21 | divide 2 | print");
+    at(5000); at(10000); at(15000); at(20000); at(21000);
+    assert(Serial.output.str().find("0\n1\n") != std::string::npos);
+    std::cout << "PASS source phases, skipped ticks, ownership, preserved GPIO, schedule captures and signal timers\n";
 
-    assert(argc == 2);
-    std::ifstream tune(argv[1]);
-    std::stringstream contents; contents << tune.rdbuf();
-    assert(!contents.str().empty());
-    fresh(); handleCommand(contents.str());
-    assert(queuedJobs() == 25);
-    for (uint64_t us = 0; us <= 12500000; us += 500) { at(us); assert(activeJobs() <= 1); }
-    assert(!totalJobs() && gpio[15] == LOW);
-    std::cout << "PASS native firmware scheduling, duration, cleanup, validation, capacity, rollover\n";
+    const uint64_t rollover = 4294967294ULL * 1000;
+    fresh(rollover);
+    handleCommand("schedule { 1 { write 12 1 } 3 { write 12 0 } }");
+    at(rollover + 1000); assert(gpio[12] == HIGH);
+    at(rollover + 3000); assert(gpio[12] == LOW && !totalJobs());
+    fresh(rollover); handleCommand("clock 1000 --dur 2 | write 15");
+    at(rollover + 500); assert(gpio[15] == HIGH);
+    at(rollover + 1000); assert(gpio[15] == LOW);
+    at(rollover + 1500); assert(gpio[15] == HIGH);
+    at(rollover + 2000); assert(gpio[15] == HIGH && !totalJobs());
+    std::cout << "PASS millisecond/microsecond rollover scheduling and clock completion\n";
 
-    fresh();
-    handleCommand("var count 0");
-    handleCommand("set count $count + 2 * 3");
-    handleCommand("print $count");
-    assert(scriptRuntime.globals->vars.at("count").number == 6);
-    assert(Serial.output.str().find("6\n") != std::string::npos);
-    handleCommand("set missing 1");
-    assert(Serial.output.str().find("invalid variable") != std::string::npos);
-    assert(scriptRuntime.tasks.empty());
+    fresh(); handleCommand("number 5 | shiftout 12 13 14 --bits 8 | print");
+    assert(gpio[14] == HIGH && Serial.output.str().find("5\n") != std::string::npos);
+    gpio[12] = HIGH; handleCommand("shiftin 12 13 14 --bits 8 | print");
+    assert(Serial.output.str().find("255\n") != std::string::npos);
+    for(const char *source : {"write 12 1 100", "clock 10 12", "read D1", "read 1", "read 12.5", "var n 0", "call F", "each", "do", "func F", "write 12 1; max 5 -1", "write 12 1; if 0 { shiftin 1 }"}) rejected(source);
+    fresh(); handleCommand("set n 0; set n $n + 1 | print");
+    assert(scriptRuntime.globals->vars.at("n").number == 1);
+    handleCommand("set n 1 / 0"); assert(scriptRuntime.globals->vars.at("n").number == 1);
+    fresh(); handleCommand("write 12 1; sleep 10; print $missing"); at(10000);
+    assert(gpio[12] == HIGH && scriptPinOwners.empty() && !scriptRuntime.failures.empty());
+    handleCommand("jobs"); assert(Serial.output.str().find("FAILED") != std::string::npos);
+    fresh(); handleCommand("reset; write 12 1"); assert(writes.empty());
+    fresh(); handleCommand("kill 1; write 12 1"); assert(writes.empty());
+    fresh(); Serial.input="set n 1\r\nprint $n\r\n"; loop();
+    assert(Serial.output.str().find("1\n") != std::string::npos);
+    std::cout << "PASS shift-register frames, early validation, failure retention, self cancellation and serial input\n";
 
-    fresh(); adcValue = 512;
-    handleCommand("do {\n var samples 0\n every 100 | adc A0 --out raw | map 0 1023 0 100 --value $raw --out percent | set samples $samples + 1 | print \"$samples:$raw:$percent\"\n }");
-    assert(scriptRuntime.tasks.size() == 1);
-    at(0); at(100000); adcValue = 1023; at(200000);
-    assert(Serial.output.str().find("1:512:50\n2:512:50\n3:1023:100\n") != std::string::npos);
-    assert(!scriptRuntime.globals->vars.count("samples"));
-    handleCommand("reset"); assert(scriptRuntime.tasks.empty());
-
-    fresh();
-    handleCommand("func notes str {\n split \" \" --value $str | each --out note {\n split \":\" --value $note --out pitch,dur | tone 15 --hz notehz($pitch) --dur int($dur)\n }\n }");
-    assert(scriptRuntime.functions.count("notes"));
-    handleCommand("do {\n every 50 | toggle | write 12\n call notes \"C4:200 E4:300\"\n print \"melody finished\"\n }");
-    assert(scriptRuntime.tasks.size() == 2);
-    at(0); assert(gpio[12] == HIGH);
-    at(2000); assert(gpio[15] == HIGH);
-    at(50000); assert(gpio[12] == LOW);
-    handleCommand("status"); assert(Serial.output.str().find("ESP8266 Commandware ready") != std::string::npos);
-    at(199000); assert(Serial.output.str().find("melody finished") == std::string::npos);
-    at(200000); // Second tone begins exactly after the first completes.
-    assert(scriptRuntime.tasks[0]->tonePin == 15);
-    assert(scriptRuntime.tasks[0]->wake == 500);
-    at(499000); assert(Serial.output.str().find("melody finished") == std::string::npos);
-    at(500000); assert(Serial.output.str().find("melody finished\n") != std::string::npos);
-    assert(scriptRuntime.tasks.size() == 1 && gpio[15] == LOW);
-    unsigned long blinkId = scriptRuntime.tasks[0]->id;
-    handleCommand((std::string("kill ") + std::to_string(blinkId)).c_str());
-    assert(scriptRuntime.tasks.empty() && gpio[12] == LOW && scriptPinOwners.empty());
-
-    fresh();
-    handleCommand("split \" \" --value \"A B C\" | each --out item | print $item | sleep 10");
-    assert(Serial.output.str().find("A\n") != std::string::npos);
-    assert(Serial.output.str().find("B\n") == std::string::npos);
-    at(10000); assert(Serial.output.str().find("B\n") != std::string::npos);
-    at(20000); assert(Serial.output.str().find("C\n") != std::string::npos);
-    at(30000); assert(scriptRuntime.tasks.empty());
-
-    fresh();
-    handleCommand("do {\n var offset 10\n schedule { $offset { clock 1000 --dur 2 | write 15 } 20 { write 12 1 } }\n print \"scheduled\"\n }");
-    assert(queuedJobs() == 2 && scriptRuntime.tasks.empty());
-    at(10000); at(10500); assert(gpio[15] == HIGH);
-    at(12000); assert(gpio[15] == LOW);
-    at(20000); assert(gpio[12] == HIGH);
-
-    fresh();
-    Serial.input = "do {\n # ignored { brace and quote \"\n var count 0\n every 10 |\n set count $count + 1 | print 'Count: $count'\n}\n";
-    loop(); assert(scriptRuntime.tasks.size() == 1);
-    assert(Serial.output.str().find("Count: 1\n") != std::string::npos);
-    handleCommand("reset");
-
-    fresh();
-    handleCommand("every 10 | tone 15 --hz 440 --dur 20"); at(0);
-    handleCommand("clock 1000 | write 15"); assert(!activeJobs());
-    size_t writeCount = writes.size(); handleCommand("write 15 1"); assert(writes.size() == writeCount);
-    handleCommand("lcd init"); assert(lcdReady); // Disjoint pins still work.
-    handleCommand("reset"); assert(scriptRuntime.tasks.empty() && scriptPinOwners.empty() && gpio[15] == LOW);
-    fresh(); handleCommand("clock 1000 | write 15");
-    handleCommand("tone 15 --hz 440 --dur 20");
-    assert(scriptRuntime.tasks.empty() && activeJobs() == 1);
-    fresh(); handleCommand("every 10 | write 4 1"); at(0);
-    handleCommand("lcd init"); assert(!lcdReady);
-    handleCommand("reset"); assert(gpio[4] == LOW);
-
-    // Parsing/unknown commands fail before any statement runs. Runtime errors
-    // stop the current job and release every pin it acquired.
-    fresh(); handleCommand("do { write 12 1; bogus }"); assert(writes.empty());
-    handleCommand("do { write 12 1; set absent 2 }");
-    assert(scriptRuntime.tasks.empty() && gpio[12] == LOW && scriptPinOwners.empty());
-    handleCommand("split \":\" --value \"C4:200:extra\" --out pitch,dur | print $pitch");
-    assert(Serial.output.str().find("output count mismatch") != std::string::npos);
-    handleCommand("do { var raw 0; adc A0 --out raw }");
-    assert(Serial.output.str().find("duplicate output name") != std::string::npos);
-    handleCommand("func recurse { call recurse }"); handleCommand("call recurse");
-    assert(scriptRuntime.tasks.empty() && Serial.output.str().find("depth exceeds 8") != std::string::npos);
-
-    fresh();
-    handleCommand("func pair str { split \":\" --value $str }");
-    handleCommand("call pair \"C4:200\" --out pitch,dur | print \"$pitch $dur\"");
-    assert(Serial.output.str().find("C4 200\n") != std::string::npos);
-    handleCommand("do { write 12 1; tone 15 --dur 200 }");
-    assert(writes.empty()); // Argument shape errors are caught before execution.
-    handleCommand("do { clock 1000 --dur 2 | write 15; print \"started\" }");
-    assert(activeJobs() == 1 && scriptRuntime.tasks.empty());
-    at(0); at(500); assert(gpio[15] == HIGH);
-    at(2000); assert(!activeJobs() && gpio[15] == LOW);
-    fresh(); handleCommand("do { adc A0 --watch | print; print \"watching\" }");
-    at(0); assert(activeJobs() == 1 && Serial.output.str().find("watching\n512\n") != std::string::npos);
-
-    fresh();
-    Serial.input = "do { var pitch C#4; print $pitch }\n"; loop();
-    assert(Serial.output.str().find("C#4\n") != std::string::npos);
-    fresh();
-    for (int i = 0; i < 8; ++i) handleCommand("sleep 100");
-    assert(scriptRuntime.tasks.size() == 8);
-    handleCommand("sleep 1"); assert(scriptRuntime.tasks.size() == 8);
-    handleCommand("func available { print \"defined at capacity\" }");
-    assert(scriptRuntime.functions.count("available"));
-    handleCommand("reset"); assert(scriptRuntime.tasks.empty());
-
-    fresh(base); handleCommand("do { sleep 3; print \"awake\" }");
-    at(base + 2000); assert(Serial.output.str().find("awake") == std::string::npos);
-    at(base + 3000); assert(Serial.output.str().find("awake\n") != std::string::npos);
-    fresh(); handleCommand("every 10 | sleep 20 | print \"sample\""); at(0); at(1000000);
-    assert(Serial.output.str().find("sample\n") != std::string::npos);
-    assert(scriptRuntime.tasks[0]->work.empty()); // No queued catch-up burst.
-
-    std::cout << "PASS scripts: records, scopes, functions, sequential notes, concurrency, serial, schedule, cancellation, rollover\n";
-
-    fresh();
-    handleCommand("var bit 0\nevery 500 | set bit !bit | write 5");
-    assert(scriptRuntime.tasks.empty() && scriptRuntime.globals->vars.empty() && writes.empty());
-    assert(Serial.output.str().find("ERROR: invalid expression: read variable values with $name") != std::string::npos);
-    fresh(); handleCommand("var bit 0");
-    handleCommand("every 500 | set bit !$bit | write 5 $bit");
-    at(0); assert(gpio[5] == HIGH);
-    at(500000); assert(gpio[5] == LOW);
-    at(1000000); assert(gpio[5] == HIGH);
-    handleCommand("reset"); assert(gpio[5] == LOW);
-    fresh(); handleCommand("var bit !0 + 2");
-    assert(scriptRuntime.globals->vars.at("bit").number == 3);
-    handleCommand("set bit !!$bit"); assert(scriptRuntime.globals->vars.at("bit").number == 1);
-    handleCommand("every 500 | print $missing"); at(0);
-    assert(scriptRuntime.tasks.empty() && scriptRuntime.failures.size() == 1);
-    handleCommand("jobs");
-    assert(Serial.output.str().find("FAILED  every 500: unknown name 'missing'") != std::string::npos);
-    handleCommand("var valid 1");
-    assert(scriptRuntime.failures.size() == 1);
-    handleCommand("reset"); assert(scriptRuntime.failures.empty());
-    std::cout << "PASS boolean expressions, early syntax errors, retained background failures\n";
-
-    for (const char *source : {
-        "split \" \" \"A B\" | each | print",
-        "split \" \" --value \"A B\" | each | print",
-        "adc A0 | split \" \" \"A B\" | each | print",
-        "adc A0 | split \" \" --value \"A B\" | each | print"
-    }) {
-        fresh(); handleCommand(source);
-        assert(Serial.output.str().find("A\nB\n") != std::string::npos);
+    fresh(); handleCommand("lcd print \"Hello | World!\"");
+    assert(lcdReady && Wire.sda == 4 && Wire.scl == 5 && Wire.address == 0x27);
+    std::string displayed;
+    for(size_t i=0;i+5<Wire.bytes.size();i+=3) if(Wire.bytes[i]&1) {
+        displayed += char((Wire.bytes[i]&0xf0)|(Wire.bytes[i+3]>>4)); i+=3;
     }
-    fresh(); handleCommand("adc A0 | split \"1\" | each | print");
-    assert(Serial.output.str().find("5\n2\n") != std::string::npos);
-    fresh(); handleCommand("split \":\" 0 | each | print");
-    assert(Serial.output.str().find("0\n") != std::string::npos);
-    fresh(); handleCommand("split \":\" \"\" | each | split \":\" | each | print");
-    assert(scriptRuntime.failures.empty() && scriptRuntime.tasks.empty());
-    assert(Serial.output.str().find("ERROR:") == std::string::npos);
-    fresh(); handleCommand("do {\n print \"ready\"\n\n # comment\n split \" \"\n}");
-    assert(Serial.output.str().find("split: value is required through pipe or explicit parameter --value at line 5\n") != std::string::npos);
-    fresh(); handleCommand("\n\nunknown");
-    assert(Serial.output.str().find("at line 3\n") != std::string::npos);
-    fresh(); handleCommand("do {\n sleep 10\n print $missing\n}"); at(10000);
-    assert(Serial.output.str().find("unknown name 'missing' at line 3\n") != std::string::npos);
-    fresh(); handleCommand("do {\n every 10 |\n print $missing\n}"); at(0);
-    handleCommand("jobs");
-    assert(scriptRuntime.failures[0].message.find("at line 3") != std::string::npos);
-    fresh(); handleCommand("func broken {\n sleep 10\n print $missing\n}");
-    handleCommand("call broken"); at(10000);
-    assert(Serial.output.str().find("unknown name 'missing' at line 3\n") != std::string::npos);
-    fresh(); handleCommand("do {\n lcd init 0\n}");
-    assert(Serial.output.str().find("at line 2\n") != std::string::npos);
-    fresh(); handleCommand("do {\n sleep 10\n lcd init 0\n}"); at(10000);
-    std::istringstream delayedErrors(Serial.output.str());
-    std::string errorLine;
-    while (std::getline(delayedErrors, errorLine))
-        if (errorLine.find("ERROR:") == 0) assert(errorLine.find("at line 3") != std::string::npos);
-    fresh(); handleCommand("read");
-    assert(Serial.output.str().find("ERROR: read requires PIN at line 1\n") != std::string::npos);
-    fresh(); handleCommand("do {\n clock 1000 | lcd print\n}");
-    Wire.error = 1; at(0); at(500);
-    assert(Serial.output.str().find("ERROR: LCD I2C communication failed; check wiring and address at line 2\n") != std::string::npos);
-    fresh(); handleCommand("schedule {\n 10 {\n lcd init 0\n }\n}"); at(10000);
-    assert(Serial.output.str().find("at line 3\n") != std::string::npos);
-    fresh(); handleCommand("do {\n schedule {\n 10 {\n lcd init 0\n }\n }\n}"); at(10000);
-    assert(Serial.output.str().find("at line 4\n") != std::string::npos);
-    fresh(); Serial.input = "do {\r\n print \"ready\"\r\n split \" \"\r\n}\r\n"; loop();
-    assert(Serial.output.str().find("--value at line 3\n") != std::string::npos);
-    std::cout << "PASS positional/piped split, absent vs zero/empty input, source lines, delayed and legacy failures, serial CRLF\n";
+    assert(displayed == "Hello | World!                  ");
+    handleCommand("write 4 1"); assert(writes.empty());
+    fresh(); handleCommand("lcd init 0x3f"); assert(lcdReady && lcdAddress==0x3f);
+    handleCommand("lcd clear");
+    fresh(); Wire.error=2; handleCommand("lcd print \"Hello\""); assert(!lcdReady);
+    std::cout << "PASS LCD rendering, initialization, I2C reservations and errors\n";
 
-    fresh(); handleCommand("var count 10; var count 0; print $count");
-    assert(scriptRuntime.globals->vars.at("count").number == 0 && scriptRuntime.failures.empty());
-    handleCommand("var count \"reset\"");
-    assert(scriptRuntime.globals->vars.at("count").str() == "reset");
-    handleCommand("do { var count 10; var count $count + 1; print $count }");
-    assert(Serial.output.str().find("11\n") != std::string::npos);
-    assert(scriptRuntime.globals->vars.at("count").str() == "reset");
-    handleCommand("func reset_count count { var count 0; print $count }; call reset_count 10");
-    assert(scriptRuntime.failures.empty());
-    fresh();
-    for (int i = 0; i < 32; ++i)
-        handleCommand((std::string("var v") + std::to_string(i) + " 0").c_str());
-    handleCommand("var v0 99");
-    assert(scriptRuntime.globals->vars.size() == 32 && scriptRuntime.globals->vars.at("v0").number == 99);
-    assert(scriptRuntime.failures.empty());
-    handleCommand("var extra 0");
-    assert(Serial.output.str().find("variable limit is 32") != std::string::npos);
-    fresh(); handleCommand("adc A0 --out raw | var raw 0");
-    assert(Serial.output.str().find("invalid variable declaration/assignment 'raw'") != std::string::npos);
-    std::cout << "PASS var redeclaration, persisted values, local scopes, capacity and event-field conflicts\n";
-
+    // Retain detailed controller/render/transport tests from the original suite.
     for (const char *controller : {"ssd1306", "sh1106"}) {
         fresh(); handleCommand((std::string("oled init ")+controller).c_str());
         assert(oledDisplay.ready && oledDisplay.reserved && Wire.sda == 4 && Wire.scl == 5);
@@ -540,7 +330,7 @@ int main(int argc, char **argv) {
     handleCommand("oled chart 1 --x 1 --width 8 --height 8");
     assert(Serial.output.str().find("chart areas must not overlap") != std::string::npos);
     handleCommand("oled clear");
-    handleCommand("do { var temp 23; var humidity 48; every 100 | oled chart $temp --min 0 --max 50 --height 32 | oled chart $humidity --min 0 --max 100 --y 32 --height 32 }");
+    handleCommand("do { set temp 23; set humidity 48; every 100 | oled chart $temp --min 0 --max 50 --height 32 | oled chart $humidity --min 0 --max 100 --y 32 --height 32 }");
     at(0); assert(oledDisplay.getPixel(127,17) && oledDisplay.getPixel(127,48));
     at(100000); assert(oledDisplay.getPixel(126,17) && oledDisplay.getPixel(126,48));
     auto retained = oledDisplay.buffer;
@@ -557,7 +347,7 @@ int main(int argc, char **argv) {
     assert(activeJobs() == 1 && oledDisplay.ready);
     fresh(); handleCommand("schedule { 10 { oled print 2 2 \"scheduled\" } }");
     at(10000); assert(oledDisplay.ready);
-    fresh(); handleCommand("clock 1 | write 4"); handleCommand("oled init");
+    fresh(); handleCommand("clock 1 | write 4"); at(500000); handleCommand("oled init");
     assert(!oledDisplay.ready && activeJobs() == 1);
     fresh(); handleCommand("every 10 | write 4 1"); at(0); handleCommand("oled init");
     assert(!oledDisplay.ready);
@@ -623,4 +413,47 @@ int main(int argc, char **argv) {
     fresh(); handleCommand("oled init; lcd init; oled print \"OLED\"; lcd print \"LCD\"");
     assert(lcdReady && oledDisplay.ready && scriptRuntime.failures.empty());
     std::cout << "PASS OLED controllers/protocols, text/coordinates, charts, cooperative transfer, errors and pin ownership\n";
+
+
+    fresh(); handleCommand("number 7 --out raw | oled rect 2 7 3 4 | print $raw | print");
+    assert(scriptRuntime.failures.empty() && Serial.output.str().find("7\n7\n") != std::string::npos);
+    for (int y = 0; y < 64; ++y) for (int x = 0; x < 128; ++x)
+        assert(oledDisplay.getPixel(x,y) == (x >= 2 && x < 5 && y >= 7 && y < 11));
+    handleCommand("oled rect 3 8 1 2 --value 0");
+    assert(!oledDisplay.getPixel(3,8) && !oledDisplay.getPixel(3,9) && oledDisplay.getPixel(2,8));
+    handleCommand("number 0 | oled rect 127 63 1 1"); assert(oledDisplay.getPixel(127,63));
+    for (const char *invalid : {"oled rect", "oled rect 0 0 1", "oled rect 0 0 1 1 1",
+        "oled rect 0 0 0 1", "oled rect 127 63 2 1", "oled rect 0 63 1 2",
+        "oled rect (-1) 0 1 1", "oled rect 0.5 0 1 1", "oled rect 0 0 1 1 --value 2",
+        "oled rect 0 0 1 1 --value bad", "oled rect 0 0 1 1 --value",
+        "oled rect 0 0 1 1 --value 0 --value 1", "oled rect 0 0 1 1 --x 0"}) {
+        fresh(); handleCommand(invalid);
+        assert(!oledDisplay.ready && Wire.packets.empty() && Serial.output.str().find("ERROR:") != std::string::npos);
+    }
+    fresh(); handleCommand("oled init sh1106 --height 32; oled rect 127 31 1 1");
+    assert(oledDisplay.getPixel(127,31));
+    auto beforeInvalid = oledDisplay.buffer; handleCommand("oled rect 0 31 1 2");
+    assert(oledDisplay.buffer == beforeInvalid);
+    std::cout << "PASS OLED filled rectangles, erasure, event preservation and geometry validation\n";
+
+    assert(argc > 1);
+    std::ifstream file(argv[1]); assert(file);
+    std::string pong((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    fresh(); handleCommand(pong.c_str());
+    // Multiple cooperative steps may be needed to complete one frame.
+    auto frame = [&](unsigned ms) { for (int i=0;i<10;++i) at((uint64_t)ms*1000); assert(scriptRuntime.failures.empty()); };
+    frame(0); assert(activeJobs() == 1 && oledDisplay.ready);
+    auto &vars = scriptRuntime.globals->vars;
+    gpio[12] = 0; gpio[14] = 1;
+    vars["leftY"] = cw::Value(28); vars["rightY"] = cw::Value(28);
+    frame(50); assert(vars["leftY"].number == 26 && vars["rightY"].number == 30);
+    vars["waiting"] = cw::Value(0); vars["ballX"] = cw::Value(6); vars["ballY"] = cw::Value(30);
+    vars["velocityX"] = cw::Value(-2); vars["velocityY"] = cw::Value(1);
+    frame(100); assert(vars["ballX"].number == 4 && vars["velocityX"].number == 2);
+    vars["waiting"] = cw::Value(0); vars["ballX"] = cw::Value(1); vars["ballY"] = cw::Value(55);
+    vars["velocityX"] = cw::Value(-2);
+    frame(150); assert(vars["rightScore"].number == 1 && vars["waiting"].number == 16);
+    for (unsigned ms=200;ms<10000;ms+=50) frame(ms);
+    assert(activeJobs() == 1);
+    std::cout << "PASS complete Pong example, independent buttons, paddle collision, scoring and sustained play\n";
 }

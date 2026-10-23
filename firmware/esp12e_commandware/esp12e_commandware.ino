@@ -4,6 +4,7 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
 #include <Wire.h>
+#include <flash_hal.h>
 
 // Credentials stay in a local, Git-ignored header. Fresh checkouts still
 // compile and provide the serial console with Wi-Fi disabled.
@@ -46,6 +47,8 @@ private:
 };
 
 static void handleCommand(const String &line, uint16_t sourceLine = 1);
+static void printJobs();
+static bool scriptRequest(const String &command, const String *source, String &response);
 static String trim(String value);
 
 static const char WEB_PAGE[] PROGMEM = R"rawliteral(
@@ -154,8 +157,8 @@ static const char WEB_PAGE[] PROGMEM = R"rawliteral(
   <dialog id="save-dialog" aria-labelledby="save-heading">
     <form id="save-form">
       <h2 id="save-heading">Save script</h2>
-      <label for="script-name">Script name</label><input id="script-name" maxlength="80" required autocomplete="off" placeholder="e.g. OLED sensor chart">
-      <p>Saved in this browser for this device address.</p>
+      <label for="script-name">Script name</label><input id="script-name" maxlength="28" required autocomplete="off" placeholder="e.g. OLED sensor chart">
+      <p>Saved on this device in flash memory.</p>
       <p id="save-error" role="alert"></p>
       <div class="dialog-actions"><button id="cancel-save" class="secondary" type="button">Cancel</button><button type="submit">Save script</button></div>
     </form>
@@ -197,59 +200,71 @@ static const char WEB_PAGE[] PROGMEM = R"rawliteral(
         ['Two charts from one reading','Raw counts and percent in separate areas on a 128×64 display. Stop old display jobs first.','do {\n  oled clear\n  oled print "Raw A0"\n  oled print 0 32 "Percent A0"\n  every 200 |\n    adc A0 --out raw |\n    map 0 1023 0 100 --out percent |\n    oled chart $raw --min 0 --max 1023 --y 8 --height 24 |\n    oled chart $percent --min 0 --max 100 --y 40 --height 24\n}']
       ]},
       {group:'GPIO and sensors',items:[
-        ['Read GPIO12','Read a digital input; GPIO numbers are used, not board D labels.','read 12'],
+        ['Read GPIO12','Read a digital input; GPIO numbers are used, not board D labels.','read 12 | print'],
         ['Set GPIO12 high','Drive a connected output high. Leaves GPIO4/5 free for I2C.','write 12 1'],
         ['Set GPIO12 low','Drive a connected output low.','write 12 0'],
-        ['100 ms output pulse','Drive GPIO12 high briefly, then return it low.','write 12 1 100'],
+        ['100 ms output pulse','Drive GPIO12 high briefly, then return it low.','pulse 100 | write 12'],
         ['Blink every 500 ms','Toggle GPIO12 in a background job. Stop it with the Kill button.','every 500 | toggle | write 12'],
-        ['Read analog input','Read the raw A0 count, from 0 to 1023.','adc A0'],
-        ['Analog percentage','Convert one A0 reading to a 0–100% value.','adc A0 | map 0 1023 0 100'],
-        ['Resistance measurement','Uses the calibrated resistor-divider circuit described in the tutorial.','ohm A0']
+        ['Read analog input','Read the raw A0 count, from 0 to 1023.','adc A0 | print'],
+        ['Analog percentage','Convert one A0 reading to a 0–100% value.','adc A0 | map 0 1023 0 100 | print'],
+        ['Resistance measurement','Uses the calibrated resistor-divider circuit described in the tutorial.','adc A0 | ohm | print']
       ]},
       {group:'Scripts and sound',items:[
-        ['Variables and arithmetic','Declare a value, change it, and print the result.','do {\n  var count 10\n  set count $count + 5\n  print $count\n}'],
-        ['Reusable function','Define and call a function with a text parameter.','func greet name {\n  print "Hello $name"\n}\n\ndo {\n  call greet "Commandware"\n}'],
+        ['Variables and arithmetic','Declare a value, change it, and print the result.','do {\n  set count 10\n  set count $count + 5\n  print $count\n}'],
+        ['Reusable function','Define and call a function with a text parameter.','func greet name {\n  print "Hello $name"\n}\n\ndo {\n  greet "Commandware"\n}'],
         ['Two-note melody','Play C4 then E4 on a buzzer connected to GPIO15.','do {\n  tone 15 --hz 262 --dur 200\n  sleep 100\n  tone 15 --hz 330 --dur 300\n}'],
         ['Timed clock output','Generate 1 kHz on GPIO15 for 500 ms.','clock 1000 --dur 500 | write 15'],
         ['Schedule two notes','Start timed GPIO15 clock jobs 1 s and 1.5 s after submission.','schedule {\n  1000 { clock 1000 --dur 500 | write 15 }\n  1500 { clock 1400 --dur 1000 | write 15 }\n}']
       ]}
     ];
-    let busy=false,editor=null,executing=false,currentName=null,savedValue='';
-    const storageKey='commandware.scripts.v1',scriptTitle=document.getElementById('script-title'),fileMessage=document.getElementById('file-message'),saveDialog=document.getElementById('save-dialog'),openDialog=document.getElementById('open-dialog'),scriptName=document.getElementById('script-name');
+    let busy=false,editor=null,executing=false,currentName=null,savedValue='',fileBusy=false;
+    const scriptTitle=document.getElementById('script-title'),fileMessage=document.getElementById('file-message'),saveDialog=document.getElementById('save-dialog'),openDialog=document.getElementById('open-dialog'),scriptName=document.getElementById('script-name');
     function editorValue(){return editor?editor.getValue():i.value}
     function updateScriptState(){const dirty=editorValue()!==savedValue;scriptTitle.textContent=(currentName||'Untitled')+(dirty?' · Unsaved changes':'');if(dirty)fileMessage.textContent=''}
     function setEditorValue(value){if(editor){editor.setValue(value);editor.clearHistory();editor.focus()}else{i.value=value;i.setSelectionRange(0,0);i.focus()}updateScriptState()}
     function discardChanges(){return editorValue()===savedValue||confirm('Discard unsaved changes to '+(currentName||'Untitled')+'?')}
-    function readScripts(){
-      const raw=localStorage.getItem(storageKey);
-      if(raw===null)return [];
-      const scripts=JSON.parse(raw);
-      if(!Array.isArray(scripts)||scripts.some(s=>!s||typeof s.name!=='string'||!s.name.trim()||typeof s.source!=='string')||new Set(scripts.map(s=>s.name)).size!==scripts.length)throw Error('Invalid saved scripts');
-      return scripts;
+    function validScriptName(name){return name.length<=28&&/^[A-Za-z0-9_ -]+$/.test(name)&&name===name.trim()}
+    function scriptCommand(action,name,source){
+      const command='script '+action+(name===undefined?'':' '+JSON.stringify(name));
+      return sendScript(command,source);
     }
-    function saveScript(name){
+    async function saveScript(name){
       name=name.trim();
       const fail=message=>{fileMessage.textContent=message;document.getElementById('save-error').textContent=message;return false};
-      if(!name||name.length>80)return fail('Enter a script name of 1–80 characters.');
+      if(!validScriptName(name))return fail('Use 1–28 letters, digits, spaces, _ or -.');
+      if(fileBusy)return false;fileBusy=true;
+      const source=editorValue();
       try{
-        const scripts=readScripts(),existing=scripts.findIndex(s=>s.name===name),source=editorValue();
-        if(existing!==-1&&name!==currentName&&!confirm('Replace saved script "'+name+'"?'))return false;
-        if(existing===-1)scripts.push({name,source});else scripts[existing]={name,source};
-        localStorage.setItem(storageKey,JSON.stringify(scripts));
-        currentName=name;savedValue=source;updateScriptState();fileMessage.textContent='Saved in this browser.';return true;
-      }catch(e){return fail('Unable to save. Browser storage may be unavailable, full, or contain invalid saved data. Your editor text is unchanged.')}
+        const names=await scriptCommand('list');
+        if(names.includes(name)&&name!==currentName&&!confirm('Replace saved script "'+name+'"?'))return false;
+        await scriptCommand('save',name,source);
+        currentName=name;savedValue=source;updateScriptState();
+        if(editorValue()===source)fileMessage.textContent='Saved on device.';
+        return true;
+      }catch(e){return fail('Unable to save: '+e.message+'. Your editor text is unchanged.')}
+      finally{fileBusy=false}
     }
-    function openScripts(){
+    async function openScripts(){
+      if(fileBusy)return;fileBusy=true;
       const list=document.getElementById('saved-scripts');list.replaceChildren();
       try{
-        const scripts=readScripts().sort((a,b)=>a.name.localeCompare(b.name));
-        if(!scripts.length)list.textContent='No saved scripts yet. Use Save to name and store a script.';
-        for(const script of scripts){
-          const button=document.createElement('button');button.type='button';button.className='secondary';button.textContent=script.name;
-          button.onclick=()=>{if(!discardChanges())return;currentName=script.name;savedValue=script.source;openDialog.close();setEditorValue(script.source);fileMessage.textContent='Opened from this browser.'};list.append(button);
+        const names=await scriptCommand('list');
+        if(!names.length)list.textContent='No saved scripts yet. Use Save to name and store a script.';
+        for(const name of names){
+          const button=document.createElement('button');button.type='button';button.className='secondary';button.textContent=name;
+          button.onclick=async()=>{
+            if(fileBusy)return;fileBusy=true;
+            try{
+              const source=await scriptCommand('load',name);
+              if(!openDialog.open||!discardChanges())return;
+              currentName=name;savedValue=source;openDialog.close();setEditorValue(source);fileMessage.textContent='Opened from device.';
+            }catch(e){fileMessage.textContent='Unable to open: '+e.message}
+            finally{fileBusy=false}
+          };list.append(button);
         }
         openDialog.showModal();
-      }catch(e){fileMessage.textContent='Unable to read saved scripts. Browser storage is unavailable or contains invalid data.'}
+      }catch(e){fileMessage.textContent='Unable to read saved scripts: '+e.message}
+      finally{fileBusy=false}
     }
     function insertSample(value){
       const content=editorValue(),cursor=editor?editor.indexFromPos(editor.getCursor('head')):i.selectionEnd;
@@ -283,11 +298,23 @@ static const char WEB_PAGE[] PROGMEM = R"rawliteral(
       d.scrollTop=0;
     }
     let requestQueue=Promise.resolve();
-    function send(c){const request=requestQueue.then(async()=>{const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),10000);try{const x=await fetch('/api/command',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({command:c}),signal:controller.signal}),t=await x.text();if(!x.ok)throw Error(t||x.statusText);return t}catch(e){if(e.name==='AbortError')throw Error('Request timed out. Check device connection; command may have executed.');throw e}finally{clearTimeout(timer)}});requestQueue=request.catch(()=>{});return request}
+    function request(path,options){const pending=requestQueue.then(async()=>{const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),10000);try{const x=await fetch(path,{...options,signal:controller.signal}),t=await x.text();if(!x.ok)throw Error(t||x.statusText);return t}catch(e){if(e.name==='AbortError')throw Error('Request timed out. Check device connection; command may have executed.');throw e}finally{clearTimeout(timer)}});requestQueue=pending.catch(()=>{});return pending}
+    function send(c){return request('/api/command',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({command:c})})}
+    async function sendScript(command,source){
+      const fields={command,result:'script'};
+      if(source!==undefined)fields.source=source;
+      let text;
+      try{text=await request('/api/command',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(fields)})}
+      catch(e){let failure;try{failure=JSON.parse(e.message)}catch{}throw Error(failure?.error||e.message)}
+      const result=JSON.parse(text);
+      if(!result.ok)throw Error(result.error);
+      return result.value;
+    }
+    function getJobs(){return request('/api/jobs',{method:'GET',cache:'no-store'})}
     async function refresh(){
       if(busy)return;busy=true;
       try{
-        const text=await send('jobs'),entries=text.split(/\r?\n/).map(s=>s.match(/^(\d+)\s+(RUNNING|FAILED)\s+(.*)$/)).filter(Boolean);
+        const text=await getJobs(),entries=text.split(/\r?\n/).map(s=>s.match(/^(\d+)\s+(RUNNING|FAILED)\s+(.*)$/)).filter(Boolean);
         j.replaceChildren();
         if(!entries.length){j.textContent='No active jobs or recorded failures.';return}
         entries.forEach(m=>{
@@ -302,10 +329,10 @@ static const char WEB_PAGE[] PROGMEM = R"rawliteral(
         });
       }catch(e){j.textContent=`Unable to load jobs: ${e}`}finally{busy=false}
     }
-    a.onclick=()=>{if(!discardChanges())return;currentName=null;savedValue='';setEditorValue('');fileMessage.textContent=''};
+    a.onclick=()=>{if(fileBusy||!discardChanges())return;currentName=null;savedValue='';setEditorValue('');fileMessage.textContent=''};
     document.getElementById('open-script').onclick=openScripts;
-    document.getElementById('save-script').onclick=()=>{if(currentName!==null){saveScript(currentName);return}scriptName.value='';document.getElementById('save-error').textContent='';saveDialog.showModal();scriptName.focus()};
-    document.getElementById('save-form').onsubmit=e=>{e.preventDefault();if(saveScript(scriptName.value))saveDialog.close()};
+    document.getElementById('save-script').onclick=()=>{if(fileBusy)return;if(currentName!==null){saveScript(currentName);return}scriptName.value='';document.getElementById('save-error').textContent='';saveDialog.showModal();scriptName.focus()};
+    document.getElementById('save-form').onsubmit=async e=>{e.preventDefault();if(await saveScript(scriptName.value))saveDialog.close()};
     document.getElementById('cancel-save').onclick=()=>saveDialog.close();
     document.getElementById('cancel-open').onclick=()=>openDialog.close();
     i.addEventListener('input',updateScriptState);
@@ -364,7 +391,7 @@ static const char WEB_PAGE[] PROGMEM = R"rawliteral(
             if(stream.match(/^"(?:[^"\\]|\\.)*"|^'(?:[^'\\]|\\.)*'/))return 'string';
             if(stream.match(/^\$[\w]+/))return 'variable-2';
             if(stream.match(/^\b\d+(?:\.\d+)?\b/))return 'number';
-            if(stream.match(/^(?:--[\w-]+|[|{}()+*/%!-])/))return 'operator';
+            if(stream.match(/^(?:--[\w-]+|&&|\|\||==|!=|<=|>=|[|{}()+*/%!<>=-])/))return 'operator';
             if(stream.match(/^[a-zA-Z_]\w*/))return 'keyword';
             stream.next();return null;
           }
@@ -391,9 +418,26 @@ static void configureWebServer()
 {
     webServer.on("/", HTTP_GET, []()
                  { webServer.send_P(200, "text/html; charset=utf-8", WEB_PAGE); });
+    webServer.on("/api/jobs", HTTP_GET, []()
+                 {
+                     StringPrint response;
+                     Print *previousOutput = commandOutput;
+                     commandOutput = &response;
+                     printJobs();
+                     commandOutput = previousOutput;
+                     webServer.sendHeader("Cache-Control", "no-store");
+                     webServer.send(200, "text/plain; charset=utf-8", response.str()); });
     webServer.on("/api/command", HTTP_POST, []()
                  {
                      String command = webServer.arg("command");
+                     if (webServer.arg("result") == "script") {
+                         String source = webServer.arg("source"), response;
+                         bool ok = scriptRequest(command, webServer.hasArg("source") ? &source : nullptr, response);
+                         webServer.sendHeader("Cache-Control", "no-store");
+                         // Structured failures use the same envelope as successes.
+                         webServer.send(ok ? 200 : 400, "application/json; charset=utf-8", response);
+                         return;
+                     }
                      if (trim(command).length() == 0)
                      {
                          webServer.send(400, "text/plain; charset=utf-8", "ERROR: command is required at line 1");
@@ -441,30 +485,12 @@ static void serviceWebServer()
     }
 }
 
-enum StageKind
-{
-    STAGE_NONE,
-    STAGE_MAP,
-    STAGE_OHM,
-    STAGE_NOT,
-    STAGE_EDGE,
-    STAGE_RISING,
-    STAGE_FALLING,
-    STAGE_DEBOUNCE,
-    STAGE_TOGGLE,
-    STAGE_DIVIDE,
-    STAGE_PULSE,
-    STAGE_WRITE,
-    STAGE_PRINT,
-    STAGE_LCD_PRINT,
-    STAGE_OLED,
-};
-
 #include "ScriptRuntime.h"
+#include "ScriptStorage.h"
+static cw::ScriptStorage scriptStorage;
 #include "OledDisplay.h"
 static cw::OledDisplay oledDisplay;
-// Legacy command handlers also pass through this stream, so even errors from
-// commands outside the script interpreter carry a location.
+// Hardware/transport errors use the same source locations as runtime errors.
 static uint16_t commandErrorLine = 1;
 class ErrorLinePrint : public Print
 {
@@ -506,68 +532,30 @@ public:
 static cw::Runtime scriptRuntime;
 static std::map<int, unsigned long> scriptPinOwners;
 static std::map<int, bool> scriptOutputPins;
+static void printStorageStatus()
+{
+#if defined(ARDUINO_ARCH_ESP8266)
+    commandOutput->print(F("Flash configured bytes: ")); commandOutput->println(ESP.getFlashChipSize());
+    commandOutput->print(F("Flash detected bytes: ")); commandOutput->println(ESP.getFlashChipRealSize());
+    commandOutput->print(F("LittleFS partition offset bytes: ")); commandOutput->println((unsigned long)FS_PHYS_ADDR);
+    commandOutput->print(F("LittleFS partition size bytes: ")); commandOutput->println((unsigned long)FS_PHYS_SIZE);
+#endif
+    if (scriptStorage.mountError()) {
+        commandOutput->print(F("LittleFS unavailable: ")); commandOutput->println(scriptStorage.mountError());
+        commandOutput->println(F("Filesystem was not formatted. See README: provision-littlefs.sh."));
+        return;
+    }
+    FSInfo info;
+    if (!LittleFS.info(info)) { commandOutput->println(F("LittleFS mounted; capacity query failed")); return; }
+    commandOutput->print(F("LittleFS ready; used bytes: ")); commandOutput->print(info.usedBytes);
+    commandOutput->print(F("; total bytes: ")); commandOutput->println(info.totalBytes);
+}
 static void configureScriptRuntime();
 static bool scriptOwnsPin(int pin) { return scriptPinOwners.count(pin) != 0; }
 static bool displayReservesPin(int pin);
 
-struct Stage
-{
-    StageKind kind = STAGE_NONE;
-    int p1 = 0;
-    int p2 = 0;
-    int p3 = 0;
-    int p4 = 0;
-    int prev = 0;
-    bool hasPrev = false;
-    int streak = 0;
-    int counter = 0;
-    int toggleState = 0;
-    int pulseRemaining = 0;
-    std::shared_ptr<std::vector<cw::Value>> oledArgs;
-};
-
-struct Job
-{
-    unsigned long id = 0;
-    bool active = false;
-    bool started = false;
-    bool isClock = true;
-    bool adcWatch = false;
-    bool hasADC = false;
-    uint16_t line = 1;
-    int lastADC = 0;
-    unsigned long startMs = 0;
-    unsigned long durationMs = 0; // Zero means unlimited.
-    unsigned long interval = 0;
-    unsigned long next = 0;
-    int clockState = 0;
-    String pipeline;
-    Stage stages[8];
-    int stageCount = 0;
-};
-
-static Job jobs[8];
-static const int MAX_SCHEDULED_COMMANDS = 32;
-struct ScheduledCommand
-{
-    unsigned long id = 0;
-    unsigned long startMs = 0;
-    unsigned long durationMs = 0;
-    unsigned long pinMask = 0;
-    bool isClock = false;
-    uint16_t line = 1;
-    String pipeline;
-};
-static ScheduledCommand scheduled[MAX_SCHEDULED_COMMANDS];
 static unsigned long nextJobId = 1;
 
-struct ClockWindow
-{
-    unsigned long startMs = 0;
-    unsigned long durationMs = 0;
-    unsigned long pinMask = 0;
-    bool active = false;
-};
 static String inputBuffer;
 static int inputBraceDepth = 0;
 static bool inputQuoted = false;
@@ -576,35 +564,6 @@ static char inputQuoteChar = 0;
 static bool inputComment = false;
 static bool inputAfterCR = false;
 static uint16_t inputLine = 1;
-
-struct PendingWritePulse
-{
-    bool active = false;
-    int pin = -1;
-    unsigned long endTime = 0;
-};
-
-static PendingWritePulse pendingWritePulse;
-
-struct SignalState
-{
-    bool hasPrev = false;
-    int prev = 0;
-    int streak = 0;
-    int toggleState = 0;
-    int divideCounter = 0;
-    int pulseRemaining = 0;
-};
-
-static void stopJob(Job &job);
-
-static SignalState directEdgeState;
-static SignalState directRisingState;
-static SignalState directFallingState;
-static SignalState directDebounceState;
-static SignalState directToggleState;
-static SignalState directDivideState;
-static SignalState directPulseState;
 
 static String trim(String value)
 {
@@ -619,56 +578,10 @@ static String trim(String value)
     return value;
 }
 
-static String nextToken(String &input)
-{
-    String trimmed = trim(input);
-    if (trimmed.length() == 0)
-    {
-        input = "";
-        return "";
-    }
-    int idx = 0;
-    while (idx < (int)trimmed.length() && trimmed[idx] != ' ' && trimmed[idx] != '\t' && trimmed[idx] != '\r' && trimmed[idx] != '\n')
-        ++idx;
-    String token;
-    if (idx == (int)trimmed.length())
-    {
-        token = trimmed;
-        input = "";
-    }
-    else
-    {
-        token = trimmed.substring(0, idx);
-        input = trimmed.substring(idx + 1);
-    }
-    return token;
-}
-
-static int toIntDef(const String &value, int fallback)
-{
-    if (value.length() == 0)
-    {
-        return fallback;
-    }
-    return value.toInt();
-}
-
-static int mapValue(int value, int inMin, int inMax, int outMin, int outMax)
-{
-    if (inMax == inMin)
-    {
-        return outMin;
-    }
-    long scaled = (long)(value - inMin) * (outMax - outMin);
-    long denom = inMax - inMin;
-    return (int)(outMin + (scaled / denom));
-}
-
 // Common PCF8574 backpack: P0=RS, P1=RW, P2=E, P3=backlight,
 // P4..P7=D4..D7. Wire ships with the ESP8266 core.
 static bool lcdReady = false;
 static uint8_t lcdAddress = 0x27;
-static const unsigned long LCD_PIN_MASK = (1UL << 4) | (1UL << 5);
 static bool displayReservesPin(int pin) { return (lcdReady || oledDisplay.reserved) && (pin == 4 || pin == 5); }
 
 static bool lcdNibble(uint8_t value)
@@ -703,27 +616,6 @@ static bool initLCD(uint8_t address)
     if (scriptOwnsPin(4) || scriptOwnsPin(5))
     {
         commandOutput->println(F("ERROR: LCD pins are owned by a script job"));
-        return false;
-    }
-    // Do not take the bus pins away from running or queued GPIO writers.
-    for (int i = 0; i < 8; ++i)
-        if (jobs[i].active)
-            for (int s = 0; s < jobs[i].stageCount; ++s)
-                if (jobs[i].stages[s].kind == STAGE_WRITE &&
-                    (jobs[i].stages[s].p1 == 4 || jobs[i].stages[s].p1 == 5))
-                {
-                    commandOutput->println(F("ERROR: LCD GPIO4/GPIO5 are used by a job"));
-                    return false;
-                }
-    for (int i = 0; i < MAX_SCHEDULED_COMMANDS; ++i)
-        if (scheduled[i].id && (scheduled[i].pinMask & LCD_PIN_MASK))
-        {
-            commandOutput->println(F("ERROR: LCD GPIO4/GPIO5 are used by a queued job"));
-            return false;
-        }
-    if (pendingWritePulse.active && (pendingWritePulse.pin == 4 || pendingWritePulse.pin == 5))
-    {
-        commandOutput->println(F("ERROR: LCD GPIO4/GPIO5 are used by a pulse"));
         return false;
     }
     lcdReady = false;
@@ -765,111 +657,32 @@ static bool printLCD(const String &text)
     return true;
 }
 
-static bool lcdLiteral(String args, String &text)
-{
-    args = trim(args);
-    if (!args.startsWith("\"")) return false;
-    for (unsigned int i = 1; i < args.length(); ++i)
-    {
-        char ch = args[i];
-        if (ch == '"') return trim(args.substring(i + 1)).length() == 0;
-        if (ch == '\\')
-        {
-            if (++i == args.length()) return false;
-            ch = args[i];
-            if (ch == 'n') ch = '\n';
-            else if (ch != '\\' && ch != '"') return false;
-        }
-        text += ch;
-    }
-    return false;
-}
-
-static void handleLCDCommand(String args)
-{
-    String action = nextToken(args);
-    action.toLowerCase();
-    if (action == "print")
-    {
-        String text;
-        if (!lcdLiteral(args, text))
-            commandOutput->println(F("ERROR: lcd print requires a double-quoted string or piped input"));
-        else if (printLCD(text)) commandOutput->println(F("OK"));
-        return;
-    }
-    if (action == "clear" && !trim(args).length())
-    {
-        if (printLCD("")) commandOutput->println(F("OK"));
-        return;
-    }
-    if (action == "init")
-    {
-        String token = nextToken(args);
-        char *end;
-        long address = token.length() ? strtol(token.c_str(), &end, 0) : 0x27;
-        if ((token.length() && *end) || address < 0x08 || address > 0x77 || trim(args).length())
-            commandOutput->println(F("ERROR: lcd init accepts an I2C address (0x08..0x77)"));
-        else if (initLCD((uint8_t)address)) commandOutput->println(F("OK"));
-        return;
-    }
-    commandOutput->println(F("ERROR: use lcd init [ADDRESS], lcd print \"TEXT\", or lcd clear"));
-}
-
-// Delimiters inside LCD strings are literal characters, including escaped quotes.
-static int unquotedIndex(const String &text, char target, int start = 0)
-{
-    bool quoted = false, escaped = false;
-    for (unsigned int i = start; i < text.length(); ++i)
-    {
-        char ch = text[i];
-        if (quoted && escaped) { escaped = false; continue; }
-        if (quoted && ch == '\\') { escaped = true; continue; }
-        if (ch == '"') { quoted = !quoted; continue; }
-        if (!quoted && ch == target) return i;
-    }
-    return -1;
-}
-
 static void printHelp()
 {
-    commandOutput->println(F("Commandware ESP-12E shell"));
-    commandOutput->println(F("help"));
-    commandOutput->println(F("pins"));
-    commandOutput->println(F("jobs"));
-    commandOutput->println(F("kill ID"));
-    commandOutput->println(F("status"));
-    commandOutput->println(F("reset"));
-    commandOutput->println(F("read PIN"));
-    commandOutput->println(F("write PIN VALUE [DURATION_MS]"));
-    commandOutput->println(F("adc A0 [--watch] (watch samples changes every 100 ms)"));
-    commandOutput->println(F("lcd init [ADDRESS] (16x2 I2C, default 0x27; SDA=4 SCL=5)"));
-    commandOutput->println(F("lcd print \"TEXT\"; lcd clear; SOURCE | lcd print"));
+    commandOutput->println(F("Commandware: events flow through source | transform | action"));
+    commandOutput->println(F("read PIN [--out NAME]; adc A0 [--watch] [--out NAME]"));
+    commandOutput->println(F("write PIN [VALUE | --value VALUE]; print [VALUE | --value VALUE]"));
+    commandOutput->println(F("map IN_MIN IN_MAX OUT_MIN OUT_MAX [VALUE | --value VALUE] [--out NAME]"));
+    commandOutput->println(F("not [VALUE | --value VALUE]; ohm [VALUE | --value VALUE]"));
+    commandOutput->println(F("clock HZ [--dur MS] [--out NAME] | write PIN; every MS [--out NAME] | COMMAND"));
+    commandOutput->println(F("edge; rising; falling; toggle; divide N; debounce MS; pulse MS"));
+    commandOutput->println(F("sleep MS; tone PIN --hz HZ --dur MS (cooperative waits)"));
+    commandOutput->println(F("set NAME EXPR; do { BODY }; if EXPR { BODY } [else { BODY }]; where EXPR"));
+    commandOutput->println(F("func NAME [PARAM...] { BODY }; NAME [ARG...] or NAME --PARAM VALUE"));
+    commandOutput->println(F("max 5 min 10 3; max --a 5 --b 10; parentheses override grouping"));
+    commandOutput->println(F("number/int/string/abs/round/floor/ceil X; min/max A B; clamp X LOW HIGH"));
+    commandOutput->println(F("len X; contains X ITEM; slice X START END; at ITEMS INDEX; join ITEMS SEPARATOR"));
+    commandOutput->println(F("trim/lower/upper TEXT; replace TEXT OLD NEW; notehz TEXT"));
+    commandOutput->println(F("split DELIMITER [VALUE | --value VALUE] [--out NAME,...]; each [--out NAME] { BODY }"));
+    commandOutput->println(F("schedule { OFFSET_MS { BODY } ... }"));
+    commandOutput->println(F("shiftin DATA CLOCK LOAD [msb|lsb] [--bits 1..53]"));
+    commandOutput->println(F("shiftout DATA CLOCK [LATCH] [msb|lsb] [--bits 1..53] [--value VALUE]"));
+    commandOutput->println(F("lcd init [ADDRESS]; lcd print [VALUE | --value VALUE]; lcd clear"));
     commandOutput->println(F("oled init [ssd1306|sh1106] [--height 32|64] [--address 0x3c|0x3d]"));
-    commandOutput->println(F("oled print [X Y] [TEXT] [--x 0 --y 0]; oled clear"));
-    commandOutput->println(F("SOURCE | oled chart [VALUE] [--min 0 --max 1023 --x 0 --y 0 --width 128 --height 64]"));
-    commandOutput->println(F("ohm [A0] (ohms, <270, >700k, OUT_OF_RANGE)"));
-    commandOutput->println(F("adc A0 | ohm (terminal measurement stage)"));
-    commandOutput->println(F("clock HZ [PIN] [--dur MILLISECONDS]"));
-    commandOutput->println(F("schedule { START_MS { COMMAND | STAGE } ... }"));
-    commandOutput->println(F("map IN_MIN IN_MAX OUT_MIN OUT_MAX VALUE"));
-    commandOutput->println(F("not VALUE"));
-    commandOutput->println(F("edge VALUE"));
-    commandOutput->println(F("rising VALUE"));
-    commandOutput->println(F("falling VALUE"));
-    commandOutput->println(F("debounce COUNT VALUE"));
-    commandOutput->println(F("toggle [VALUE]"));
-    commandOutput->println(F("divide N VALUE"));
-    commandOutput->println(F("pulse DURATION VALUE"));
-    commandOutput->println(F("print VALUE"));
-    commandOutput->println(F("shiftin DATA CLOCK LOAD [msb|lsb] [BITS]"));
-    commandOutput->println(F("shiftout DATA CLOCK LATCH [msb|lsb] VALUE"));
-    commandOutput->println(F("do { COMMAND; COMMAND; ... }"));
-    commandOutput->println(F("every MILLISECONDS | COMMAND | ..."));
-    commandOutput->println(F("var NAME EXPR / set NAME EXPR (read with $NAME)"));
-    commandOutput->println(F("func NAME [PARAM...] { BODY } / call NAME [ARG...]"));
-    commandOutput->println(F("split DELIM [VALUE | --value VALUE] [--out NAME,...]"));
-    commandOutput->println(F("each [--out NAME] [ { BODY } ] (sequential)"));
-    commandOutput->println(F("tone PIN --hz HZ --dur MS / sleep MS"));
+    commandOutput->println(F("oled print [X Y] [VALUE] [--x X --y Y]; oled chart [VALUE] [--min N --max N --x X --y Y --width W --height H]; oled rect X Y WIDTH HEIGHT [--value 0|1]; oled clear"));
+    commandOutput->println(F("script list | print; script save NAME (string input); script load NAME | print; script delete NAME"));
+    commandOutput->println(F("help [COMMAND]; pins; jobs; kill ID; status; reset (preserves GPIO and functions)"));
+    commandOutput->println(F("Shift frames default to 8 bits. run NAME is simulator-only. Use print for console values."));
 }
 
 static void printPins()
@@ -916,1288 +729,9 @@ static void printJobs()
     {
         commandOutput->print(task->id);
         commandOutput->print(F(" RUNNING  "));
+        if (task->scheduled) commandOutput->print(F("[queued] "));
         commandOutput->println(task->label.c_str());
     }
-    for (int i = 0; i < 8; ++i)
-    {
-        if (!jobs[i].active)
-        {
-            continue;
-        }
-        commandOutput->print(jobs[i].id);
-        commandOutput->print(F(" RUNNING  "));
-        commandOutput->println(jobs[i].pipeline);
-    }
-    for (int i = 0; i < MAX_SCHEDULED_COMMANDS; ++i)
-        if (scheduled[i].id)
-        {
-            commandOutput->print(scheduled[i].id);
-            commandOutput->print(F(" RUNNING  [queued] "));
-            commandOutput->println(scheduled[i].pipeline);
-        }
-}
-
-static int splitPipeline(const String &line, String parts[], int maxParts)
-{
-    int count = 0;
-    int start = 0;
-    while (start <= line.length() && count < maxParts)
-    {
-        int idx = unquotedIndex(line, '|', start);
-        String piece;
-        if (idx < 0)
-        {
-            piece = line.substring(start);
-            start = line.length() + 1;
-        }
-        else
-        {
-            piece = line.substring(start, idx);
-            start = idx + 1;
-        }
-        piece = trim(piece);
-        if (piece.length() > 0)
-        {
-            parts[count++] = piece;
-        }
-    }
-    return count;
-}
-
-// Measured counts -> millivolts -> piecewise exponential resistance.
-// Calibration: 20160-ohm reference, 3357-ohm parallel shunt.
-static void printOhmReading(int raw)
-{
-    if (raw < 0 || raw > 1023)
-    {
-        commandOutput->println(F("OUT_OF_RANGE"));
-        return;
-    }
-    // Counts 30-49 extrapolate the first measured segment (which starts at 50).
-    if (raw < 30)
-    {
-        commandOutput->println(F("<270"));
-        return;
-    }
-    if (raw > 720)
-    {
-        commandOutput->println(F(">700k"));
-        return;
-    }
-    static const int counts[] = {50, 179, 291, 459, 557, 628, 703, 720};
-    static const float millivolts[] = {60, 181, 288, 449, 543, 612, 682, 697};
-    static const long resistances[] = {270, 995, 1992, 5152, 9959, 20020, 108800, 688900};
-    for (int i = 0; i < 8; ++i)
-    {
-        if (raw == counts[i])
-        {
-            commandOutput->println(resistances[i]);
-            return;
-        }
-    }
-    for (int i = 1; i < 8; ++i)
-    {
-        if (raw <= counts[i])
-        {
-            float voltage = (millivolts[i - 1] + (raw - counts[i - 1]) *
-                (millivolts[i] - millivolts[i - 1]) / (counts[i] - counts[i - 1]));
-            float fraction = (voltage - millivolts[i - 1]) / (millivolts[i] - millivolts[i - 1]);
-            float resistance = resistances[i - 1] * expf(fraction *
-                logf((float)resistances[i] / resistances[i - 1]));
-            commandOutput->println((long)(resistance + 0.5f));
-            return;
-        }
-    }
-}
-
-static bool applySignalStage(Stage &stage, bool &hasValue, int &value)
-{
-    if (!hasValue)
-    {
-        return true;
-    }
-
-    switch (stage.kind)
-    {
-    case STAGE_OHM:
-        printOhmReading(value);
-        hasValue = false;
-        return true;
-    case STAGE_MAP:
-        value = mapValue(value, stage.p1, stage.p2, stage.p3, stage.p4);
-        return true;
-    case STAGE_NOT:
-        value = (value == 0) ? 1 : 0;
-        return true;
-    case STAGE_EDGE:
-        if (!stage.hasPrev)
-        {
-            stage.prev = value;
-            stage.hasPrev = true;
-            return true;
-        }
-        if (value == stage.prev)
-        {
-            hasValue = false;
-            return true;
-        }
-        stage.prev = value;
-        return true;
-    case STAGE_RISING:
-    {
-        bool emit = stage.hasPrev && value > stage.prev;
-        stage.prev = value;
-        stage.hasPrev = true;
-        if (!emit)
-        {
-            hasValue = false;
-        }
-        return true;
-    }
-    case STAGE_FALLING:
-    {
-        bool emit = stage.hasPrev && value < stage.prev;
-        stage.prev = value;
-        stage.hasPrev = true;
-        if (!emit)
-        {
-            hasValue = false;
-        }
-        return true;
-    }
-    case STAGE_DEBOUNCE:
-    {
-        int threshold = max(1, stage.p1);
-        if (!stage.hasPrev || value != stage.prev)
-        {
-            stage.prev = value;
-            stage.hasPrev = true;
-            stage.streak = 1;
-        }
-        else
-        {
-            stage.streak++;
-        }
-        if (stage.streak < threshold)
-        {
-            hasValue = false;
-        }
-        return true;
-    }
-    case STAGE_TOGGLE:
-        stage.toggleState = (stage.toggleState == 0) ? 1 : 0;
-        value = stage.toggleState;
-        return true;
-    case STAGE_DIVIDE:
-    {
-        int divisor = max(1, stage.p1);
-        stage.counter++;
-        if ((stage.counter % divisor) != 0)
-        {
-            hasValue = false;
-        }
-        return true;
-    }
-    case STAGE_PULSE:
-    {
-        int duration = max(1, stage.p1);
-        bool rising = stage.hasPrev && stage.prev == 0 && value == 1;
-        if (!stage.hasPrev && value == 1)
-        {
-            rising = true;
-        }
-        stage.prev = value;
-        stage.hasPrev = true;
-        if (rising)
-        {
-            stage.pulseRemaining = duration;
-        }
-        value = stage.pulseRemaining > 0 ? 1 : 0;
-        if (stage.pulseRemaining > 0)
-        {
-            stage.pulseRemaining--;
-        }
-        return true;
-    }
-    case STAGE_WRITE:
-    {
-        int writeValue = (stage.p2 >= 0) ? stage.p2 : value;
-        int durationMs = (stage.p3 >= 0) ? stage.p3 : ((stage.p2 >= 0) ? value : -1);
-
-        pinMode(stage.p1, OUTPUT);
-        digitalWrite(stage.p1, writeValue ? HIGH : LOW);
-
-        if (durationMs > 0 && writeValue != 0)
-        {
-            pendingWritePulse.pin = stage.p1;
-            pendingWritePulse.endTime = millis() + (unsigned long)durationMs;
-            pendingWritePulse.active = true;
-        }
-        return true;
-    }
-    case STAGE_PRINT:
-        commandOutput->println(value);
-        return true;
-    case STAGE_LCD_PRINT:
-        return printLCD(String(value));
-    case STAGE_OLED:
-    {
-        cw::Event event; event.hasValue = hasValue; event.value = cw::Value(value);
-        std::string error;
-        if (oledDisplay.command(*stage.oledArgs, event, commandErrorLine, (uint32_t)millis(), error)) return true;
-        commandOutput->print(F("ERROR: ")); commandOutput->println(error.c_str()); return false;
-    }
-    default:
-        return false;
-    }
-}
-
-static bool parsePipelineStage(const String &stageText, Stage &stage)
-{
-    String oledText = stageText;
-    if (nextToken(oledText).equalsIgnoreCase("oled")) {
-        std::string error; cw::Parser parser(error); auto body = parser.parse(stageText.c_str());
-        if (!error.empty() || body.size() != 1 || body[0].size() != 1 || !body[0][0]->body.empty() || body[0][0]->args.empty()) return false;
-        auto args = std::make_shared<std::vector<cw::Value>>();
-        cw::Scope scope; cw::Event event;
-        for (const auto &token : body[0][0]->args) {
-            args->push_back(cw::expressionToken(token) ? cw::Expression(token.text, scope, event, error).run() : cw::Value(token.text));
-            if (!error.empty()) return false;
-        }
-        stage.kind = STAGE_OLED; stage.oledArgs = args; return true;
-    }
-    String args = stageText;
-    String name = nextToken(args);
-    name.toLowerCase();
-
-    if (name == "lcd")
-    {
-        if (!nextToken(args).equalsIgnoreCase("print") || trim(args).length()) return false;
-        stage.kind = STAGE_LCD_PRINT;
-        return true;
-    }
-    if (name == "ohm")
-    {
-        if (args.length() != 0)
-            return false;
-        stage.kind = STAGE_OHM;
-        return true;
-    }
-    if (name == "map")
-    {
-        stage.kind = STAGE_MAP;
-        stage.p1 = toIntDef(nextToken(args), 0);
-        stage.p2 = toIntDef(nextToken(args), 1);
-        stage.p3 = toIntDef(nextToken(args), 0);
-        stage.p4 = toIntDef(nextToken(args), 1);
-        return true;
-    }
-    if (name == "not")
-    {
-        stage.kind = STAGE_NOT;
-        return true;
-    }
-    if (name == "edge")
-    {
-        stage.kind = STAGE_EDGE;
-        return true;
-    }
-    if (name == "rising")
-    {
-        stage.kind = STAGE_RISING;
-        return true;
-    }
-    if (name == "falling")
-    {
-        stage.kind = STAGE_FALLING;
-        return true;
-    }
-    if (name == "debounce")
-    {
-        stage.kind = STAGE_DEBOUNCE;
-        stage.p1 = toIntDef(nextToken(args), 1);
-        return true;
-    }
-    if (name == "toggle")
-    {
-        stage.kind = STAGE_TOGGLE;
-        return true;
-    }
-    if (name == "divide")
-    {
-        stage.kind = STAGE_DIVIDE;
-        stage.p1 = toIntDef(nextToken(args), 2);
-        return true;
-    }
-    if (name == "pulse")
-    {
-        stage.kind = STAGE_PULSE;
-        stage.p1 = toIntDef(nextToken(args), 1);
-        return true;
-    }
-    if (name == "write")
-    {
-        int pin = toIntDef(nextToken(args), -1);
-        if (pin < 0 || scriptOwnsPin(pin) || displayReservesPin(pin))
-        {
-            return false;
-        }
-        stage.kind = STAGE_WRITE;
-        stage.p1 = pin;
-        stage.p2 = -1;
-        stage.p3 = -1;
-
-        String valueToken = nextToken(args);
-        if (valueToken.length() > 0)
-        {
-            stage.p2 = toIntDef(valueToken, -1);
-            String durationToken = nextToken(args);
-            if (durationToken.length() > 0)
-            {
-                stage.p3 = toIntDef(durationToken, -1);
-            }
-        }
-        return true;
-    }
-    if (name == "print")
-    {
-        stage.kind = STAGE_PRINT;
-        return true;
-    }
-
-    return false;
-}
-
-static void handleReadCommand(String args)
-{
-    String token = nextToken(args);
-    int pin = toIntDef(token, -1);
-    if (pin < 0)
-    {
-        commandOutput->println(F("ERROR: read requires PIN"));
-        return;
-    }
-    pinMode(pin, INPUT);
-    commandOutput->println(digitalRead(pin));
-}
-
-static void handleWriteCommand(String args)
-{
-    String token = nextToken(args);
-    int pin = toIntDef(token, -1);
-    String valueToken = nextToken(args);
-    int value = toIntDef(valueToken, LOW);
-    String durationToken = nextToken(args);
-    int durationMs = toIntDef(durationToken, -1);
-    if (pin < 0)
-    {
-        commandOutput->println(F("ERROR: write requires PIN VALUE"));
-        return;
-    }
-    pinMode(pin, OUTPUT);
-    digitalWrite(pin, value ? HIGH : LOW);
-
-    if (value == 0)
-    {
-        pendingWritePulse.active = false;
-        pendingWritePulse.pin = -1;
-        pendingWritePulse.endTime = 0;
-    }
-    else if (durationMs > 0)
-    {
-        pendingWritePulse.pin = pin;
-        pendingWritePulse.endTime = millis() + (unsigned long)durationMs;
-        pendingWritePulse.active = true;
-    }
-    else
-    {
-        pendingWritePulse.active = false;
-        pendingWritePulse.pin = -1;
-        pendingWritePulse.endTime = 0;
-    }
-
-    commandOutput->println(value ? 1 : 0);
-}
-
-static void handleADCCommand(String args)
-{
-    String token = nextToken(args);
-    if (token.length() == 0 || !token.equalsIgnoreCase("A0") || trim(args).length())
-    {
-        commandOutput->println(F("ERROR: adc requires A0"));
-        return;
-    }
-    commandOutput->println(analogRead(A0));
-}
-
-static void handleMapCommand(String args)
-{
-    String a1 = nextToken(args);
-    String a2 = nextToken(args);
-    String a3 = nextToken(args);
-    String a4 = nextToken(args);
-    String value = nextToken(args);
-    int inMin = a1.toInt();
-    int inMax = a2.toInt();
-    int outMin = a3.toInt();
-    int outMax = a4.toInt();
-    int current = value.toInt();
-    commandOutput->println(mapValue(current, inMin, inMax, outMin, outMax));
-}
-
-static void handleNotCommand(String args)
-{
-    int current = toIntDef(nextToken(args), 0);
-    commandOutput->println(current == 0 ? 1 : 0);
-}
-
-static void handleEdgeCommand(String args)
-{
-    int current = toIntDef(nextToken(args), 0);
-    if (!directEdgeState.hasPrev || current != directEdgeState.prev)
-    {
-        commandOutput->println(current);
-    }
-    else
-    {
-        commandOutput->println(0);
-    }
-    directEdgeState.prev = current;
-    directEdgeState.hasPrev = true;
-}
-
-static void handleRisingCommand(String args)
-{
-    int current = toIntDef(nextToken(args), 0);
-    int output = (directRisingState.hasPrev && current > directRisingState.prev) ? 1 : 0;
-    directRisingState.prev = current;
-    directRisingState.hasPrev = true;
-    commandOutput->println(output);
-}
-
-static void handleFallingCommand(String args)
-{
-    int current = toIntDef(nextToken(args), 0);
-    int output = (directFallingState.hasPrev && current < directFallingState.prev) ? 1 : 0;
-    directFallingState.prev = current;
-    directFallingState.hasPrev = true;
-    commandOutput->println(output);
-}
-
-static void handleDebounceCommand(String args)
-{
-    int threshold = max(1, toIntDef(nextToken(args), 1));
-    int current = toIntDef(nextToken(args), 0);
-
-    if (!directDebounceState.hasPrev || current != directDebounceState.prev)
-    {
-        directDebounceState.prev = current;
-        directDebounceState.hasPrev = true;
-        directDebounceState.streak = 1;
-    }
-    else
-    {
-        directDebounceState.streak++;
-    }
-
-    if (directDebounceState.streak >= threshold)
-    {
-        commandOutput->println(current);
-    }
-    else
-    {
-        commandOutput->println(0);
-    }
-}
-
-static void handleToggleCommand(String args)
-{
-    (void)args;
-    directToggleState.toggleState = (directToggleState.toggleState == 0) ? 1 : 0;
-    commandOutput->println(directToggleState.toggleState);
-}
-
-static void handleDivideCommand(String args)
-{
-    int divisor = max(1, toIntDef(nextToken(args), 2));
-    int current = toIntDef(nextToken(args), 0);
-    directDivideState.divideCounter++;
-    if ((directDivideState.divideCounter % divisor) == 0)
-    {
-        commandOutput->println(current);
-    }
-    else
-    {
-        commandOutput->println(0);
-    }
-}
-
-static void handlePulseCommand(String args)
-{
-    int duration = max(1, toIntDef(nextToken(args), 1));
-    int current = toIntDef(nextToken(args), 0);
-    bool rising = directPulseState.hasPrev && directPulseState.prev == 0 && current == 1;
-    if (!directPulseState.hasPrev && current == 1)
-    {
-        rising = true;
-    }
-    directPulseState.prev = current;
-    directPulseState.hasPrev = true;
-    if (rising)
-    {
-        directPulseState.pulseRemaining = duration;
-    }
-    int output = directPulseState.pulseRemaining > 0 ? 1 : 0;
-    if (directPulseState.pulseRemaining > 0)
-    {
-        directPulseState.pulseRemaining--;
-    }
-    commandOutput->println(output);
-}
-
-static void handlePrintCommand(String args)
-{
-    int value = toIntDef(nextToken(args), 0);
-    commandOutput->println(value);
-}
-
-static void handleShiftinCommand(String args)
-{
-    int dataPin = toIntDef(nextToken(args), -1);
-    int clockPin = toIntDef(nextToken(args), -1);
-    int loadPin = toIntDef(nextToken(args), -1);
-    String orderToken = nextToken(args);
-    int bits = max(1, toIntDef(nextToken(args), 8));
-    if (dataPin < 0 || clockPin < 0 || loadPin < 0)
-    {
-        commandOutput->println(F("ERROR: shiftin requires DATA CLOCK LOAD [msb|lsb] [BITS]"));
-        return;
-    }
-
-    bool msb = orderToken.length() == 0 || orderToken.equalsIgnoreCase("msb");
-
-    pinMode(dataPin, INPUT);
-    pinMode(clockPin, OUTPUT);
-    pinMode(loadPin, OUTPUT);
-
-    digitalWrite(loadPin, LOW);
-    digitalWrite(loadPin, HIGH);
-
-    unsigned int value = 0;
-    for (int i = 0; i < bits; ++i)
-    {
-        digitalWrite(clockPin, HIGH);
-        int bit = digitalRead(dataPin) ? 1 : 0;
-        digitalWrite(clockPin, LOW);
-        if (msb)
-        {
-            value = (value << 1) | bit;
-        }
-        else
-        {
-            value |= (bit << i);
-        }
-    }
-
-    commandOutput->println((int)value);
-}
-
-static void handleShiftoutCommand(String args)
-{
-    String dataToken = nextToken(args);
-    String clockToken = nextToken(args);
-    String latchToken = nextToken(args);
-    String orderToken = nextToken(args);
-    String valueToken = nextToken(args);
-
-    int dataPin = dataToken.toInt();
-    int clockPin = clockToken.toInt();
-    int latchPin = latchToken.toInt();
-    int value = valueToken.toInt();
-
-    pinMode(dataPin, OUTPUT);
-    pinMode(clockPin, OUTPUT);
-    pinMode(latchPin, OUTPUT);
-
-    bool msb = orderToken.length() == 0 || orderToken.equalsIgnoreCase("msb");
-    for (int i = 0; i < 8; ++i)
-    {
-        int bitIndex = msb ? (7 - i) : i;
-        int bit = (value >> bitIndex) & 1;
-        digitalWrite(dataPin, bit ? HIGH : LOW);
-        digitalWrite(clockPin, HIGH);
-        digitalWrite(clockPin, LOW);
-    }
-    digitalWrite(latchPin, HIGH);
-    digitalWrite(latchPin, LOW);
-    commandOutput->println(value);
-}
-
-static void handleKillCommand(String args)
-{
-    int id = toIntDef(nextToken(args), -1);
-    if (id < 1)
-    {
-        commandOutput->println(F("ERROR: kill requires valid job id"));
-        return;
-    }
-    if (scriptRuntime.kill((unsigned long)id))
-    {
-        commandOutput->print(F("killed "));
-        commandOutput->println(id);
-        return;
-    }
-    for (int i = 0; i < 8; ++i)
-        if (jobs[i].active && jobs[i].id == (unsigned long)id)
-        {
-            stopJob(jobs[i]);
-            commandOutput->print(F("killed "));
-            commandOutput->println(id);
-            return;
-        }
-    for (int i = 0; i < MAX_SCHEDULED_COMMANDS; ++i)
-        if (scheduled[i].id == (unsigned long)id)
-        {
-            scheduled[i] = ScheduledCommand();
-            commandOutput->print(F("killed "));
-            commandOutput->println(id);
-            return;
-        }
-    commandOutput->print(F("ERROR: unknown job "));
-    commandOutput->println(id);
-}
-
-static bool evaluateImmediateSource(const String &sourceText, bool &hasValue, int &value)
-{
-    String args = sourceText;
-    String name = nextToken(args);
-    name.toLowerCase();
-
-    if (name == "read")
-    {
-        int pin = toIntDef(nextToken(args), -1);
-        if (scriptOwnsPin(pin) || displayReservesPin(pin))
-        {
-            commandOutput->println(F("ERROR: GPIO4/GPIO5 are reserved for display I2C"));
-            return false;
-        }
-        if (pin < 0)
-        {
-            commandOutput->println(F("ERROR: read requires PIN"));
-            return false;
-        }
-        pinMode(pin, INPUT);
-        value = digitalRead(pin) ? 1 : 0;
-        hasValue = true;
-        return true;
-    }
-    if (name == "adc")
-    {
-        String pin = nextToken(args);
-        if (!pin.equalsIgnoreCase("A0") || trim(args).length())
-        {
-            commandOutput->println(F("ERROR: adc requires A0"));
-            return false;
-        }
-        value = analogRead(A0);
-        hasValue = true;
-        return true;
-    }
-    if (name == "map")
-    {
-        int inMin = toIntDef(nextToken(args), 0);
-        int inMax = toIntDef(nextToken(args), 1);
-        int outMin = toIntDef(nextToken(args), 0);
-        int outMax = toIntDef(nextToken(args), 1);
-        int current = toIntDef(nextToken(args), 0);
-        value = mapValue(current, inMin, inMax, outMin, outMax);
-        hasValue = true;
-        return true;
-    }
-    if (name == "not")
-    {
-        value = toIntDef(nextToken(args), 0);
-        value = (value == 0) ? 1 : 0;
-        hasValue = true;
-        return true;
-    }
-    if (name == "edge" || name == "rising" || name == "falling" || name == "debounce" || name == "toggle" || name == "divide" || name == "pulse")
-    {
-        int current = toIntDef(nextToken(args), 0);
-        hasValue = true;
-        value = current;
-        return true;
-    }
-    if (name == "write")
-    {
-        int pin = toIntDef(nextToken(args), -1);
-        if (scriptOwnsPin(pin) || displayReservesPin(pin))
-        {
-            commandOutput->println(F("ERROR: GPIO4/GPIO5 are reserved for display I2C"));
-            return false;
-        }
-        if (pin < 0)
-        {
-            commandOutput->println(F("ERROR: write requires PIN VALUE"));
-            return false;
-        }
-        int v = toIntDef(nextToken(args), 0);
-        pinMode(pin, OUTPUT);
-        digitalWrite(pin, v ? HIGH : LOW);
-        value = v ? 1 : 0;
-        hasValue = true;
-        return true;
-    }
-    if (name == "print")
-    {
-        value = toIntDef(nextToken(args), 0);
-        hasValue = true;
-        return true;
-    }
-
-    commandOutput->print(F("ERROR: unsupported pipeline source '"));
-    commandOutput->print(name);
-    commandOutput->println(F("'"));
-    return false;
-}
-
-static void runImmediatePipeline(const String &line)
-{
-    String parts[10];
-    int partCount = splitPipeline(line, parts, 10);
-    if (partCount <= 0)
-    {
-        return;
-    }
-
-    bool hasValue = false;
-    int value = 0;
-    if (!evaluateImmediateSource(parts[0], hasValue, value))
-    {
-        return;
-    }
-
-    bool hasSink = false;
-    for (int i = 1; i < partCount; ++i)
-    {
-        Stage stage;
-        if (!parsePipelineStage(parts[i], stage))
-        {
-            commandOutput->print(F("ERROR: unsupported pipeline stage '"));
-            commandOutput->print(parts[i]);
-            commandOutput->println(F("'"));
-            return;
-        }
-        if (stage.kind == STAGE_WRITE || stage.kind == STAGE_PRINT || stage.kind == STAGE_LCD_PRINT || stage.kind == STAGE_OLED)
-        {
-            hasSink = true;
-        }
-        if (!applySignalStage(stage, hasValue, value))
-        {
-            commandOutput->println(F("ERROR: pipeline stage failure"));
-            return;
-        }
-    }
-
-    if (hasValue && !hasSink)
-    {
-        commandOutput->println(value);
-    }
-}
-
-// Restrict deadlines to half the millis() range for rollover-safe comparisons.
-static bool parseMilliseconds(const String &token, unsigned long &value, bool allowZero)
-{
-    if (!token.length()) return false;
-    value = 0;
-    for (unsigned int i = 0; i < token.length(); ++i)
-    {
-        if (token[i] < '0' || token[i] > '9') return false;
-        unsigned int digit = token[i] - '0';
-        if (value > (2147483647UL - digit) / 10) return false;
-        value = value * 10 + digit;
-    }
-    return allowZero || value > 0;
-}
-
-static void stopJob(Job &job)
-{
-    if (job.started && job.isClock)
-    {
-        for (int s = 0; s < job.stageCount; ++s)
-            if (job.stages[s].kind == STAGE_WRITE)
-            {
-                int pin = job.stages[s].p1;
-                pinMode(pin, OUTPUT);
-                digitalWrite(pin, LOW);
-                if (pendingWritePulse.active && pendingWritePulse.pin == pin)
-                    pendingWritePulse.active = false;
-            }
-    }
-    job = Job();
-}
-
-static ClockWindow clockWindow(const Job &job)
-{
-    ClockWindow result;
-    result.active = job.active && job.isClock;
-    result.startMs = job.startMs;
-    result.durationMs = job.durationMs;
-    for (int i = 0; i < job.stageCount; ++i)
-        if (job.stages[i].kind == STAGE_WRITE)
-            result.pinMask |= 1UL << job.stages[i].p1;
-        else if (job.stages[i].kind == STAGE_LCD_PRINT || job.stages[i].kind == STAGE_OLED)
-            result.pinMask |= LCD_PIN_MASK | (1UL << 18);
-    return result;
-}
-
-static ClockWindow clockWindow(const ScheduledCommand &entry)
-{
-    ClockWindow result;
-    result.active = entry.isClock && entry.pipeline.length();
-    result.startMs = entry.startMs;
-    result.durationMs = entry.durationMs;
-    result.pinMask = entry.pinMask;
-    return result;
-}
-
-static bool windowsConflict(const ClockWindow &a, const ClockWindow &b, unsigned long now)
-{
-    if (!a.active || !b.active || !(a.pinMask & b.pinMask)) return false;
-    int64_t aStart = (long)(a.startMs - now), bStart = (long)(b.startMs - now);
-    int64_t aEnd = a.durationMs ? aStart + a.durationMs : INT64_MAX;
-    int64_t bEnd = b.durationMs ? bStart + b.durationMs : INT64_MAX;
-    return aEnd > bStart && bEnd > aStart;
-}
-
-static bool windowContains(const ClockWindow &window, int64_t offset, unsigned long now)
-{
-    int64_t start = (long)(window.startMs - now);
-    return window.active && start <= offset &&
-        (!window.durationMs || offset < start + window.durationMs);
-}
-
-static ClockWindow plannedWindow(int index, const ScheduledCommand *incoming, int count)
-{
-    if (index < 8) return clockWindow(jobs[index]);
-    index -= 8;
-    if (index < MAX_SCHEDULED_COMMANDS) return clockWindow(scheduled[index]);
-    index -= MAX_SCHEDULED_COMMANDS;
-    return index < count ? clockWindow(incoming[index]) : ClockWindow();
-}
-
-// Validate both GPIO ownership and the eight concurrent execution slots at
-// every start boundary, without reserving one full pipeline per future note.
-static bool validatePlan(const ScheduledCommand *incoming, int count, unsigned long now)
-{
-    int total = 8 + MAX_SCHEDULED_COMMANDS + count;
-    for (int i = 0; i < total; ++i)
-    {
-        ClockWindow a = plannedWindow(i, incoming, count);
-        if (!a.active) continue;
-        int concurrent = 0;
-        int64_t offset = max((int64_t)0, (int64_t)(long)(a.startMs - now));
-        for (int j = 0; j < total; ++j)
-        {
-            ClockWindow b = plannedWindow(j, incoming, count);
-            if (i != j && windowsConflict(a, b, now))
-            {
-                commandOutput->println(F("ERROR: overlapping clock writes to the same pin"));
-                return false;
-            }
-            if (windowContains(b, offset, now)) ++concurrent;
-        }
-        if (concurrent > 8)
-        {
-            commandOutput->println(F("ERROR: schedule exceeds 8 concurrent clocks"));
-            return false;
-        }
-    }
-    return true;
-}
-
-static bool prepareClockJob(const String &line, Job &job)
-{
-    int separators = 0;
-    for (unsigned int i = 0; i < line.length(); ++i)
-        if (line[i] == '|') ++separators;
-    String parts[10];
-    int partCount = splitPipeline(line, parts, 10);
-    if (partCount <= 0 || separators != partCount - 1 || partCount > 9)
-    {
-        commandOutput->println(F("ERROR: invalid or too long clock pipeline"));
-        return false;
-    }
-
-    String sourceArgs = parts[0];
-    String sourceName = nextToken(sourceArgs);
-    sourceName.toLowerCase();
-    if (sourceName != "clock")
-    {
-        commandOutput->println(F("ERROR: pipeline source must start with clock"));
-        return false;
-    }
-
-    String frequencyToken = nextToken(sourceArgs);
-    char *frequencyEnd;
-    float frequency = strtof(frequencyToken.c_str(), &frequencyEnd);
-    if (*frequencyEnd != '\0' || !isfinite(frequency) || frequencyToken.length() == 0 || frequency < 0.01f || frequency > 1000000.0f)
-    {
-        commandOutput->println(F("ERROR: clock frequency must be between 0.01 and 1000000 Hz"));
-        return false;
-    }
-    unsigned long halfPeriod = max(1UL, (unsigned long)(500000.0f / frequency + 0.5f));
-    int fallbackPin = -1;
-    bool hasDuration = false;
-    while (trim(sourceArgs).length())
-    {
-        String token = nextToken(sourceArgs);
-        if (token == "--dur" && !hasDuration)
-        {
-            if (!parseMilliseconds(nextToken(sourceArgs), job.durationMs, false))
-            {
-                commandOutput->println(F("ERROR: --dur requires 1..2147483647 milliseconds"));
-                return false;
-            }
-            hasDuration = true;
-        }
-        else if (fallbackPin < 0 && token != "--dur")
-        {
-            unsigned long pin;
-            if (!parseMilliseconds(token, pin, true) || pin > 16)
-            {
-                commandOutput->println(F("ERROR: invalid clock argument"));
-                return false;
-            }
-            fallbackPin = (int)pin;
-        }
-        else
-        {
-            commandOutput->println(F("ERROR: invalid clock argument"));
-            return false;
-        }
-    }
-
-    Stage parsedStages[8];
-    int stageCount = 0;
-    bool hasSink = false;
-
-    for (int i = 1; i < partCount; ++i)
-    {
-        if (stageCount >= 8)
-        {
-            commandOutput->println(F("ERROR: pipeline too long"));
-            return false;
-        }
-        Stage stage;
-        if (!parsePipelineStage(parts[i], stage))
-        {
-            commandOutput->print(F("ERROR: unsupported pipeline stage '"));
-            commandOutput->print(parts[i]);
-            commandOutput->println(F("'"));
-            return false;
-        }
-        if (stage.kind == STAGE_WRITE && stage.p1 > 16)
-        {
-            commandOutput->println(F("ERROR: invalid clock output pin"));
-            return false;
-        }
-        if (stage.kind == STAGE_WRITE || stage.kind == STAGE_PRINT || stage.kind == STAGE_LCD_PRINT || stage.kind == STAGE_OLED)
-        {
-            hasSink = true;
-        }
-        parsedStages[stageCount++] = stage;
-    }
-
-    if (!hasSink && fallbackPin >= 0)
-    {
-        if (scriptOwnsPin(fallbackPin) || displayReservesPin(fallbackPin))
-        {
-            commandOutput->println(F("ERROR: GPIO4/GPIO5 are reserved for display I2C"));
-            return false;
-        }
-        Stage writeStage;
-        writeStage.kind = STAGE_WRITE;
-        writeStage.p1 = fallbackPin;
-        writeStage.p2 = -1;
-        writeStage.p3 = -1;
-        if (stageCount < 8)
-        {
-            parsedStages[stageCount++] = writeStage;
-            hasSink = true;
-        }
-    }
-
-    if (!hasSink)
-    {
-        if (stageCount == 8)
-        {
-            commandOutput->println(F("ERROR: pipeline too long"));
-            return false;
-        }
-        Stage printStage;
-        printStage.kind = STAGE_PRINT;
-        parsedStages[stageCount++] = printStage;
-    }
-
-    job.active = true;
-    job.interval = halfPeriod;
-    job.clockState = 0;
-    job.stageCount = stageCount;
-    job.pipeline = trim(line);
-    for (int s = 0; s < stageCount; ++s)
-        job.stages[s] = parsedStages[s];
-    return true;
-}
-
-static bool prepareBackgroundJob(const String &line, Job &job)
-{
-    String parts[10];
-    int count = splitPipeline(line, parts, 10);
-    String args = count ? parts[0] : String("");
-    String name = nextToken(args);
-    if (name.equalsIgnoreCase("clock")) return prepareClockJob(line, job);
-    if (!name.equalsIgnoreCase("adc") || !nextToken(args).equalsIgnoreCase("A0") ||
-        nextToken(args) != "--watch" || trim(args).length())
-    {
-        commandOutput->println(F("ERROR: expected adc A0 --watch"));
-        return false;
-    }
-    // Reuse pipeline compilation, resource checks, and the eight job slots.
-    String compiled = String("clock 5") + line.substring(parts[0].length());
-    if (!prepareClockJob(compiled, job)) return false;
-    job.pipeline = line;
-    job.adcWatch = true;
-    return true;
-}
-
-static bool startClockJob(const String &line)
-{
-    Job job;
-    if (!prepareBackgroundJob(line, job)) return false;
-    job.line = commandErrorLine;
-    job.startMs = millis();
-    ScheduledCommand proposed;
-    proposed.pipeline = job.pipeline;
-    proposed.isClock = true;
-    proposed.startMs = job.startMs;
-    proposed.durationMs = job.durationMs;
-    proposed.pinMask = clockWindow(job).pinMask;
-    if (!validatePlan(&proposed, 1, job.startMs)) return false;
-    for (int i = 0; i < 8; ++i)
-        if (!jobs[i].active)
-        {
-            job.id = nextJobId++;
-            jobs[i] = job;
-            commandOutput->print(F("Started job "));
-            commandOutput->println(job.id);
-            return true;
-        }
-    commandOutput->println(F("ERROR: no free jobs"));
-    return false;
-}
-
-static bool startSchedule(String text)
-{
-    text = trim(text);
-    if (!text.startsWith("{") || !text.endsWith("}"))
-    {
-        commandOutput->println(F("ERROR: schedule requires { START_MS { COMMAND } ... }"));
-        return false;
-    }
-    text = text.substring(1, text.length() - 1);
-    uint16_t sourceLine = commandErrorLine;
-    // Store only command text and timing for future notes; compiled stages
-    // occupy the eight execution slots only while their clocks are running.
-    ScheduledCommand *queued = new (std::nothrow) ScheduledCommand[MAX_SCHEDULED_COMMANDS];
-    if (!queued)
-    {
-        commandOutput->println(F("ERROR: not enough memory for schedule"));
-        return false;
-    }
-    int count = 0;
-    bool valid = true;
-    while (text.length() && valid)
-    {
-        unsigned int leading = 0;
-        while (leading < text.length() && isspace((unsigned char)text[leading]))
-            if (text[leading++] == '\n') ++sourceLine;
-        text = text.substring(leading);
-        if (!text.length()) break;
-        commandErrorLine = sourceLine;
-        int open = unquotedIndex(text, '{'), close = unquotedIndex(text, '}');
-        unsigned long offset;
-        if (count == MAX_SCHEDULED_COMMANDS || open < 0 || close < open ||
-            !parseMilliseconds(trim(text.substring(0, open)), offset, true))
-        { valid = false; break; }
-        String pipeline = trim(text.substring(open + 1, close));
-        uint16_t pipelineLine = sourceLine;
-        unsigned int commandStart = open + 1;
-        while (commandStart < (unsigned int)close && isspace((unsigned char)text[commandStart])) ++commandStart;
-        for (unsigned int i = 0; i < commandStart; ++i) if (text[i] == '\n') ++pipelineLine;
-        commandErrorLine = pipelineLine;
-        queued[count].line = pipelineLine;
-        if (!pipeline.length() || unquotedIndex(pipeline, '{') >= 0)
-        { valid = false; break; }
-        String args = pipeline;
-        String name = nextToken(args);
-        name.toLowerCase();
-        if (name == "clock" || (name == "adc" && args.indexOf("--watch") >= 0))
-        {
-            Job parsed;
-            if (!prepareBackgroundJob(pipeline, parsed)) { valid = false; break; }
-            queued[count].isClock = true;
-            queued[count].durationMs = parsed.durationMs;
-            queued[count].pinMask = clockWindow(parsed).pinMask;
-        }
-        else
-        {
-            // Immediate commands run once when their deadline arrives.
-            const String allowed = " read write adc ohm lcd oled map not edge rising falling debounce toggle divide pulse print shiftin shiftout status pins help ";
-            if (allowed.indexOf(String(" ") + name + " ") < 0)
-            { valid = false; break; }
-            String parts[10];
-            int partCount = splitPipeline(pipeline, parts, 10);
-            int separators = 0;
-            for (int i = unquotedIndex(pipeline, '|'); i >= 0; i = unquotedIndex(pipeline, '|', i + 1))
-                ++separators;
-            if (partCount > 9 || separators != partCount - 1)
-            { valid = false; break; }
-            for (int i = 1; i < partCount; ++i)
-            {
-                Stage stage;
-                if (!parsePipelineStage(parts[i], stage)) valid = false;
-            }
-            if (!valid) break;
-            queued[count].isClock = false;
-        }
-        queued[count].pipeline = pipeline;
-        if (queued[count].durationMs > 2147483647UL - offset)
-        { valid = false; break; }
-        queued[count++].startMs = offset;
-        for (int i = 0; i <= close; ++i) if (text[i] == '\n') ++sourceLine;
-        text = text.substring(close + 1);
-    }
-    int freeCount = 0;
-    for (int i = 0; i < MAX_SCHEDULED_COMMANDS; ++i) if (!scheduled[i].id) ++freeCount;
-    if (!valid || !count || count > freeCount)
-    {
-        delete[] queued;
-        commandOutput->println(F("ERROR: invalid schedule or queue full (maximum 32 pending entries)"));
-        return false;
-    }
-    unsigned long base = millis();
-    for (int i = 0; i < count; ++i) queued[i].startMs += base;
-    if (!validatePlan(queued, count, base))
-    {
-        delete[] queued;
-        return false;
-    }
-    int entry = 0;
-    for (int i = 0; i < MAX_SCHEDULED_COMMANDS && entry < count; ++i)
-        if (!scheduled[i].id)
-        {
-            queued[entry].id = nextJobId++;
-            scheduled[i] = queued[entry++];
-            commandOutput->print(F("Scheduled job "));
-            commandOutput->println(scheduled[i].id);
-        }
-    delete[] queued;
-    return true;
-}
-
-static void executeJobs()
-{
-    unsigned long now = millis();
-    // Finish every expired note before starting any note at the same boundary.
-    for (int i = 0; i < 8; ++i)
-        if (jobs[i].active && jobs[i].durationMs &&
-            (long)(now - (jobs[i].startMs + jobs[i].durationMs)) >= 0)
-            stopJob(jobs[i]);
-    // Start due entries in timestamp order, even if the block was unordered.
-    for (int n = 0; n < MAX_SCHEDULED_COMMANDS; ++n)
-    {
-        int first = -1;
-        for (int i = 0; i < MAX_SCHEDULED_COMMANDS; ++i)
-            if (scheduled[i].id && (long)(now - scheduled[i].startMs) >= 0 &&
-                (first < 0 || (long)(scheduled[i].startMs - scheduled[first].startMs) < 0))
-                first = i;
-        if (first < 0) break;
-        ScheduledCommand &entry = scheduled[first];
-        commandErrorLine = entry.line;
-        if (entry.durationMs && (long)(now - (entry.startMs + entry.durationMs)) >= 0)
-        {
-            entry = ScheduledCommand(); // Skip a note whose entire window was missed.
-            continue;
-        }
-        if (!entry.isClock)
-        {
-            String command = entry.pipeline;
-            uint16_t sourceLine = entry.line;
-            entry = ScheduledCommand();
-            handleCommand(command, sourceLine);
-            continue;
-        }
-        int slot = -1;
-        for (int i = 0; i < 8; ++i) if (!jobs[i].active) { slot = i; break; }
-        if (slot < 0) break; // Preflight reserves capacity; retry if the loop ran late.
-        Job parsed;
-        if (prepareBackgroundJob(entry.pipeline, parsed))
-        {
-            parsed.id = entry.id;
-            parsed.startMs = entry.startMs;
-            parsed.line = entry.line;
-            jobs[slot] = parsed;
-        }
-        entry = ScheduledCommand();
-    }
-    for (int i = 0; i < 8; ++i)
-    {
-        Job &job = jobs[i];
-        commandErrorLine = job.line;
-        if (!job.active || (long)(now - job.startMs) < 0) continue;
-        if (!job.isClock)
-        {
-            String command = job.pipeline;
-            stopJob(job);
-            handleCommand(command, job.line);
-            continue;
-        }
-        if (!job.started)
-        {
-            job.started = true;
-            for (int s = 0; s < job.stageCount; ++s)
-                if (job.stages[s].kind == STAGE_WRITE)
-                {
-                    pinMode(job.stages[s].p1, OUTPUT);
-                    digitalWrite(job.stages[s].p1, LOW);
-                }
-            job.next = micros() + (job.adcWatch ? 0 : job.interval);
-        }
-        if ((long)(micros() - job.next) >= 0)
-        {
-            job.clockState = 1 - job.clockState;
-            int value = job.adcWatch ? analogRead(A0) : job.clockState;
-            if (job.adcWatch)
-            {
-                job.next = micros() + job.interval;
-                if (job.hasADC && job.lastADC == value) continue;
-                job.hasADC = true;
-                job.lastADC = value;
-            }
-            bool hasValue = true;
-            for (int s = 0; s < job.stageCount; ++s)
-                if (!applySignalStage(job.stages[s], hasValue, value))
-                { stopJob(job); break; }
-            if (job.active && !job.adcWatch) job.next += job.interval;
-        }
-    }
-}
-
-static void serviceJobs()
-{
-    ErrorOutputScope output;
-    executeJobs();
 }
 
 static bool scriptClaimPin(int pin, unsigned long owner)
@@ -2207,12 +741,6 @@ static bool scriptClaimPin(int pin, unsigned long owner)
     if (displayReservesPin(pin)) return false;
     auto existing = scriptPinOwners.find(pin);
     if (existing != scriptPinOwners.end()) return existing->second == owner;
-    unsigned long mask = 1UL << pin;
-    for (const auto &job : jobs)
-        if (job.active && (clockWindow(job).pinMask & mask)) return false;
-    for (const auto &entry : scheduled)
-        if (entry.id && (entry.pinMask & mask)) return false;
-    if (pendingWritePulse.active && pendingWritePulse.pin == pin) return false;
     scriptPinOwners[pin] = owner;
     return true;
 }
@@ -2222,14 +750,6 @@ static void configureScriptRuntime()
     oledDisplay.begin = [](int address, std::string &error) {
         if (lcdReady && address == lcdAddress) { error = "oled: address is already used by LCD"; return false; }
         if (scriptOwnsPin(4) || scriptOwnsPin(5)) { error = "oled: I2C pins are owned by a script job"; return false; }
-        for (const auto &job : jobs) if (job.active)
-            for (int i = 0; i < job.stageCount; ++i)
-                if (job.stages[i].kind == STAGE_WRITE && (job.stages[i].p1 == 4 || job.stages[i].p1 == 5))
-                { error = "oled: I2C pins are used by a running job"; return false; }
-        for (const auto &entry : scheduled) if (entry.id && (entry.pinMask & LCD_PIN_MASK))
-            { error = "oled: I2C pins are reserved by a queued job"; return false; }
-        if (pendingWritePulse.active && (pendingWritePulse.pin == 4 || pendingWritePulse.pin == 5))
-            { error = "oled: I2C pins are used by a pulse"; return false; }
         Wire.begin(4, 5);
         Wire.setClock(100000);
         return true;
@@ -2239,14 +759,6 @@ static void configureScriptRuntime()
         if (Wire.write(control) != 1) { Wire.endTransmission(); return 1; }
         for (size_t i = 0; i < count; ++i) if (Wire.write(bytes[i]) != 1) { Wire.endTransmission(); return 1; }
         return (int)Wire.endTransmission();
-    };
-    scriptRuntime.background = [](const std::string &text) {
-        ErrorOutputScope output(scriptRuntime.executingLine);
-        return startClockJob(String(text.c_str()));
-    };
-    scriptRuntime.schedule = [](const std::string &text) {
-        ErrorOutputScope output(scriptRuntime.executingLine);
-        return startSchedule(String(text.c_str()));
     };
     scriptRuntime.newId = []() { return nextJobId++; };
     scriptRuntime.output = [](const std::string &s) { commandOutput->println(s.c_str()); };
@@ -2258,77 +770,89 @@ static void configureScriptRuntime()
     scriptRuntime.release = [](unsigned long id) {
         for (auto it = scriptPinOwners.begin(); it != scriptPinOwners.end();)
             if (it->second == id) {
-                if (scriptOutputPins.count(it->first)) {
-                    pinMode(it->first, OUTPUT); digitalWrite(it->first, LOW);
-                    scriptOutputPins.erase(it->first);
-                }
+                scriptOutputPins.erase(it->first);
                 it = scriptPinOwners.erase(it);
             } else ++it;
     };
     scriptRuntime.host = [](const std::string &name, const std::vector<cw::Value> &supplied, cw::Event &event,
                             unsigned long id, std::string &error) {
         ErrorOutputScope output(scriptRuntime.executingLine);
+        if (name == "script") return scriptStorage.command(supplied, event, error);
         if (name == "oled") return oledDisplay.command(supplied, event, scriptRuntime.executingLine, (uint32_t)millis(), error);
         auto args = supplied;
         cw::Value input = event.value;
-        for (size_t i = 0; i < args.size(); ++i) if (args[i].str() == "--value") {
-            if (i + 2 != args.size()) { error = "--value requires one value at end"; return false; }
-            input = args[i+1]; args.resize(i); break;
+        bool explicitValue = false;
+        for (size_t i = 0; i < args.size(); ++i) if (args[i].option && args[i].str() == "--value") {
+            if (explicitValue || i + 2 != args.size()) { error = "--value requires one final value"; return false; }
+            input = args[i+1]; args.resize(i); explicitValue = true; break;
         }
-        auto number = [&](const cw::Value &v) {
-            if (v.kind != cw::Value::NUMBER || !std::isfinite(v.number) || v.number < -2147483647.0 || v.number > 2147483647.0) {
-                error = "command requires numeric input"; return 0;
-            }
-            return (int)v.number;
+        auto number = [&](const cw::Value &v) { return cw::numericValue(v, error); };
+        auto integer = [&](const cw::Value &v, double low, double high) {
+            double n = number(v);
+            if (error.empty() && (n != std::trunc(n) || n < low || n > high)) error = "integer argument is outside supported range";
+            return error.empty() ? n : 0.0;
         };
         auto pin = [&](const cw::Value &v) {
-            int p = number(v);
-            if (error.empty() && (!scriptClaimPin(p, id) || v.number != p)) error = "GPIO is invalid or reserved";
+            int p = (int)integer(v, 0, 16);
+            if (error.empty() && !scriptClaimPin(p, id)) error = "GPIO is invalid, reserved, or owned by another job";
             return p;
         };
-        if (name == "adc" && args.size() == 1 && cw::lower(args[0].str()) == "a0") {
-            event.value = cw::Value(analogRead(A0)); return true;
+        auto selected = [&](size_t positional, bool required = true) {
+            if (args.size() > positional) {
+                if (explicitValue) error = "provide positional value or --value, not both";
+                else input = args[positional];
+            } else if (required && !explicitValue && !event.hasValue) error = "pipeline value is required";
+            return input;
+        };
+        if (name == "adc" && args.size() == 1 && cw::lower(args[0].str()) == "a0" && !explicitValue) {
+            event.value = cw::Value(analogRead(A0)); event.hasValue = true; return true;
         }
-        if (name == "read" && args.size() == 1) {
+        if (name == "read" && args.size() == 1 && !explicitValue) {
             int p = pin(args[0]); if (!error.empty()) return false;
-            pinMode(p, INPUT); event.value = cw::Value(digitalRead(p)); return true;
+            pinMode(p, INPUT); event.value = cw::Value(digitalRead(p)); event.hasValue = true; return true;
         }
         if (name == "write" && (args.size() == 1 || args.size() == 2)) {
-            int p = pin(args[0]), value = number(args.size() == 2 ? args[1] : input);
-            if (!error.empty()) return false;
-            scriptOutputPins[p] = true;
-            pinMode(p, OUTPUT); digitalWrite(p, value ? HIGH : LOW); event.value = cw::Value(value != 0); return true;
+            double value = number(selected(1));
+            int p = pin(args[0]); if (!error.empty()) return false;
+            scriptOutputPins[p] = true; pinMode(p, OUTPUT); digitalWrite(p, value != 0 ? HIGH : LOW);
+            return true;
         }
-        if (name == "map" && args.size() == 4) {
-            int a = number(args[0]), b = number(args[1]), c = number(args[2]), d = number(args[3]), v = number(input);
+        if (name == "map" && (args.size() == 4 || args.size() == 5)) {
+            double value = number(selected(4));
+            double a = number(args[0]), b = number(args[1]), c = number(args[2]), d = number(args[3]);
             if (!error.empty()) return false;
             if (a == b) { error = "map input range cannot be zero"; return false; }
-            event.value = cw::Value(c + (double(v) - a) * (double(d) - c) / (double(b) - a));
-            event.value.number = std::trunc(event.value.number); return true;
+            double result = std::trunc(c + (value-a) * (d-c) / (b-a));
+            if (!std::isfinite(result)) { error = "map result must be finite"; return false; }
+            event.value = cw::Value(result); event.hasValue = true; return true;
         }
-        if (name == "not" && args.empty()) {
-            event.value = cw::Value(number(input) == 0); return error.empty();
+        if (name == "not" && args.size() <= 1) {
+            double value = number(selected(0)); if (!error.empty()) return false;
+            event.value = cw::Value(value == 0); event.hasValue = true; return true;
         }
         if (name == "print" && args.size() <= 1) {
-            commandOutput->println((args.empty() ? input.str() : args[0].str()).c_str()); return true;
+            cw::Value value = selected(0); if (!error.empty()) return false;
+            commandOutput->println(cw::formatValue(value).c_str()); return error.empty();
         }
         if (name == "lcd" && !args.empty()) {
             std::string action = cw::lower(args[0].str());
-            if (action == "init" && args.size() <= 2) {
-                int address = args.size() == 2 ? number(args[1]) : 0x27;
-                if (address < 8 || address > 0x77) error = "invalid LCD I2C address";
+            if (action == "init" && args.size() <= 2 && !explicitValue) {
+                int address = args.size() == 2 ? (int)integer(args[1], 8, 0x77) : 0x27;
                 if (error.empty() && initLCD((uint8_t)address)) return true;
-            } else if ((action == "print" && args.size() <= 2) || (action == "clear" && args.size() == 1)) {
-                std::string text = action == "clear" ? "" : args.size() == 2 ? args[1].str() : input.str();
-                if (printLCD(String(text.c_str()))) return true;
+            } else if (action == "print" && args.size() <= 2) {
+                cw::Value value = selected(1);
+                std::string text = cw::formatValue(value);
+                if (error.empty() && printLCD(String(text.c_str()))) return true;
+            } else if (action == "clear" && args.size() == 1 && !explicitValue) {
+                if (printLCD(String(""))) return true;
             }
             if (error.empty()) error = "LCD command failed";
             return false;
         }
-        if (name == "ohm" && args.empty()) {
-            // Match the numeric portion of the existing calibrated conversion.
-            int raw = number(input);
+        if (name == "ohm" && args.size() <= 1) {
+            double rawValue = integer(selected(0), -2147483647.0, 2147483647.0);
             if (!error.empty()) return false;
+            int raw = (int)rawValue;
             if (raw < 0 || raw > 1023) event.value = cw::Value(std::string("OUT_OF_RANGE"));
             else if (raw < 30) event.value = cw::Value(std::string("<270"));
             else if (raw > 720) event.value = cw::Value(std::string(">700k"));
@@ -2339,7 +863,82 @@ static void configureScriptRuntime()
                 double fraction = double(raw-counts[index]) / (counts[index+1]-counts[index]);
                 event.value = cw::Value(std::floor(resistance[index] * exp(fraction * log(resistance[index+1]/resistance[index])) + 0.5));
             }
+            event.hasValue = true; return true;
+        }
+        if (name == "shiftin" || name == "shiftout") {
+            bool reading = name == "shiftin";
+            std::vector<cw::Value> pins;
+            std::string order = "msb";
+            int bits = 8; bool haveBits = false, haveOrder = false;
+            for (size_t i = 0; i < args.size(); ++i) {
+                if (args[i].option) {
+                    if (args[i].str() != "--bits" || haveBits || i+1 == args.size()) { error = "invalid shift-register option"; return false; }
+                    bits = (int)integer(args[++i], 1, 53); haveBits = true;
+                } else if (args[i].kind == cw::Value::TEXT && (cw::lower(args[i].str()) == "msb" || cw::lower(args[i].str()) == "lsb")) {
+                    if (haveOrder) { error = "duplicate bit order"; return false; }
+                    order = cw::lower(args[i].str()); haveOrder = true;
+                } else pins.push_back(args[i]);
+            }
+            if ((reading && (pins.size() != 3 || explicitValue)) || (!reading && (pins.size() < 2 || pins.size() > 3))) {
+                error = "invalid shift-register pins/value"; return false;
+            }
+            double value = 0;
+            if (!reading) {
+                if (!explicitValue && !event.hasValue) { error = "pipeline value is required"; return false; }
+                value = integer(input, 0, std::ldexp(1.0, bits)-1);
+            }
+            std::vector<int> gpioPins;
+            for (const auto &v : pins) {
+                int p = (int)integer(v, 0, 16);
+                if (std::find(gpioPins.begin(), gpioPins.end(), p) != gpioPins.end()) error = "shift-register pins must be distinct";
+                gpioPins.push_back(p);
+            }
+            if (!error.empty()) return false;
+            for (int p : gpioPins) if (!scriptClaimPin(p, id)) { error = "GPIO is invalid, reserved, or owned by another job"; return false; }
+            int data = gpioPins[0], clock = gpioPins[1];
+            pinMode(clock, OUTPUT); digitalWrite(clock, LOW); scriptOutputPins[clock] = true;
+            uint64_t frame = (uint64_t)value;
+            if (reading) {
+                int load = gpioPins[2]; pinMode(data, INPUT); pinMode(load, OUTPUT); scriptOutputPins[load] = true;
+                digitalWrite(load, LOW); delayMicroseconds(1); digitalWrite(load, HIGH);
+                frame = 0;
+                for (int i = 0; i < bits; ++i) {
+                    uint64_t sample = digitalRead(data) ? 1 : 0;
+                    if (order == "msb") frame = (frame << 1) | sample;
+                    else frame |= sample << i;
+                    digitalWrite(clock, HIGH); delayMicroseconds(1); digitalWrite(clock, LOW);
+                }
+                event.value = cw::Value((double)frame); event.hasValue = true;
+            } else {
+                pinMode(data, OUTPUT); scriptOutputPins[data] = true;
+                if (gpioPins.size() == 3) { pinMode(gpioPins[2], OUTPUT); scriptOutputPins[gpioPins[2]] = true; digitalWrite(gpioPins[2], LOW); }
+                for (int i = 0; i < bits; ++i) {
+                    int index = order == "msb" ? bits-1-i : i;
+                    digitalWrite(data, (frame >> index) & 1); digitalWrite(clock, HIGH); delayMicroseconds(1); digitalWrite(clock, LOW);
+                }
+                if (gpioPins.size() == 3) digitalWrite(gpioPins[2], HIGH);
+            }
             return true;
+        }
+        if (name == "help" && args.size() <= 1 && !explicitValue) { printHelp(); return true; }
+        if (name == "pins" && args.empty() && !explicitValue) { printPins(); return true; }
+        if (name == "jobs" && args.empty() && !explicitValue) { printJobs(); return true; }
+        if (name == "kill" && args.size() == 1 && !explicitValue) {
+            unsigned long target = (unsigned long)integer(args[0], 1, 4294967295.0);
+            if (!error.empty()) return false;
+            if (!scriptRuntime.kill(target)) { error = "unknown job ID"; return false; }
+            commandOutput->println(F("killed")); return true;
+        }
+        if (name == "reset" && args.empty() && !explicitValue) {
+            scriptRuntime.reset(); commandOutput->println(F("reset")); return true;
+        }
+        if (name == "status" && args.empty() && !explicitValue) {
+            commandOutput->println(F("ESP8266 Commandware ready"));
+            commandOutput->print(F("Uptime ms: ")); commandOutput->println(millis());
+            commandOutput->print(F("Free heap: ")); commandOutput->println(ESP.getFreeHeap());
+            commandOutput->print(F("Wi-Fi status: ")); commandOutput->println((int)WiFi.status());
+            commandOutput->print(F("IP: ")); commandOutput->println(WiFi.localIP());
+            printStorageStatus(); return true;
         }
         error = "invalid arguments for '" + name + "'"; return false;
     };
@@ -2347,254 +946,78 @@ static void configureScriptRuntime()
 
 static void executeCommand(const String &line)
 {
-    String commandLine = trim(line);
-    if (commandLine.length() == 0)
-    {
-        return;
+    if (trim(line).length() == 0) return;
+    configureScriptRuntime();
+    std::string source(commandErrorLine - 1, '\n');
+    source += line.c_str();
+    if (!scriptRuntime.submit(source, (uint32_t)millis(), (uint32_t)micros())) {
+        commandOutput->print(F("ERROR: "));
+        commandOutput->println(scriptRuntime.error.c_str());
     }
-
-    String scheduleArgs = commandLine;
-    String scheduleName = nextToken(scheduleArgs);
-    if (scheduleName.equalsIgnoreCase("schedule") && commandLine.indexOf('$') < 0)
-    {
-        int brace = unquotedIndex(line, '{');
-        for (int i = 0; i < brace; ++i) if (line[i] == '\n') ++commandErrorLine;
-        startSchedule(scheduleArgs);
-        return;
-    }
-
-    std::string first = cw::lower(scheduleName.c_str());
-    const std::string scriptCommands = " do func call var set every each split sleep tone oled ";
-    bool scriptPipeline = scriptCommands.find(" " + first + " ") != std::string::npos;
-    for (int separator = unquotedIndex(commandLine, '|'); !scriptPipeline && separator >= 0;
-         separator = unquotedIndex(commandLine, '|', separator + 1))
-    {
-        String remaining = commandLine.substring(separator + 1);
-        std::string name = cw::lower(nextToken(remaining).c_str());
-        scriptPipeline = !name.empty() && scriptCommands.find(" " + name + " ") != std::string::npos;
-    }
-    if (scriptPipeline ||
-        commandLine.indexOf('$') >= 0 || commandLine.indexOf("--out") >= 0 ||
-        line.indexOf('\n') >= 0 || commandLine.indexOf(';') >= 0 || commandLine.startsWith("#"))
-    {
-        configureScriptRuntime();
-        std::string source(commandErrorLine - 1, '\n');
-        source += line.c_str();
-        if (!scriptRuntime.submit(source, (uint32_t)millis(), (uint32_t)micros()))
-        {
-            commandOutput->print(F("ERROR: "));
-            commandOutput->println(scriptRuntime.error.c_str());
-        }
-        return;
-    }
-
-    String backgroundArgs = commandLine;
-    String backgroundName = nextToken(backgroundArgs);
-    if (backgroundName.equalsIgnoreCase("adc") && backgroundArgs.indexOf("--watch") >= 0)
-    {
-        startClockJob(commandLine);
-        return;
-    }
-
-    if (unquotedIndex(commandLine, '|') >= 0)
-    {
-        String source = commandLine;
-        String sourceName = nextToken(source);
-        sourceName.toLowerCase();
-        if (sourceName == "clock")
-        {
-            startClockJob(commandLine);
-        }
-        else
-        {
-            runImmediatePipeline(commandLine);
-        }
-        return;
-    }
-
-    String command = nextToken(commandLine);
-    command.toLowerCase();
-    if (command == "read" || command == "write" || command == "shiftin" || command == "shiftout")
-    {
-        String pins = commandLine;
-        int count = (command == "read" || command == "write") ? 1 : 3;
-        for (int i = 0; i < count; ++i)
-            if (scriptOwnsPin(toIntDef(nextToken(pins), -1)))
-            {
-                commandOutput->println(F("ERROR: GPIO is owned by a script job"));
-                return;
-            }
-    }
-    if ((lcdReady || oledDisplay.reserved) && (command == "read" || command == "write" || command == "shiftin" || command == "shiftout"))
-    {
-        String pins = commandLine;
-        int count = (command == "read" || command == "write") ? 1 : 3;
-        for (int i = 0; i < count; ++i)
-        {
-            int pin = toIntDef(nextToken(pins), -1);
-            if (pin == 4 || pin == 5)
-            {
-                commandOutput->println(F("ERROR: GPIO4/GPIO5 are reserved for display I2C"));
-                return;
-            }
-        }
-    }
-    if (command == "lcd")
-    {
-        handleLCDCommand(commandLine);
-        return;
-    }
-    if (command == "help")
-    {
-        printHelp();
-        return;
-    }
-    if (command == "pins")
-    {
-        printPins();
-        return;
-    }
-    if (command == "jobs")
-    {
-        printJobs();
-        return;
-    }
-    if (command == "kill")
-    {
-        handleKillCommand(commandLine);
-        return;
-    }
-    if (command == "reset")
-    {
-        scriptRuntime.reset();
-        for (int i = 0; i < 8; ++i)
-        {
-            stopJob(jobs[i]);
-        }
-        for (int i = 0; i < MAX_SCHEDULED_COMMANDS; ++i)
-            scheduled[i] = ScheduledCommand();
-        if (pendingWritePulse.active)
-        {
-            digitalWrite(pendingWritePulse.pin, LOW);
-            pendingWritePulse.active = false;
-        }
-        commandOutput->println(F("reset"));
-        return;
-    }
-    if (command == "read")
-    {
-        handleReadCommand(commandLine);
-        return;
-    }
-    if (command == "write")
-    {
-        handleWriteCommand(commandLine);
-        return;
-    }
-    if (command == "adc")
-    {
-        handleADCCommand(commandLine);
-        return;
-    }
-    if (command == "ohm")
-    {
-        String pin = nextToken(commandLine);
-        if ((pin.length() && !pin.equalsIgnoreCase("A0")) || nextToken(commandLine).length())
-        {
-            commandOutput->println(F("ERROR: ohm accepts only A0"));
-            return;
-        }
-        printOhmReading(analogRead(A0));
-        return;
-    }
-    if (command == "clock")
-    {
-        startClockJob(line);
-        return;
-    }
-    if (command == "map")
-    {
-        handleMapCommand(commandLine);
-        return;
-    }
-    if (command == "not")
-    {
-        handleNotCommand(commandLine);
-        return;
-    }
-    if (command == "edge")
-    {
-        handleEdgeCommand(commandLine);
-        return;
-    }
-    if (command == "rising")
-    {
-        handleRisingCommand(commandLine);
-        return;
-    }
-    if (command == "falling")
-    {
-        handleFallingCommand(commandLine);
-        return;
-    }
-    if (command == "debounce")
-    {
-        handleDebounceCommand(commandLine);
-        return;
-    }
-    if (command == "toggle")
-    {
-        handleToggleCommand(commandLine);
-        return;
-    }
-    if (command == "divide")
-    {
-        handleDivideCommand(commandLine);
-        return;
-    }
-    if (command == "pulse")
-    {
-        handlePulseCommand(commandLine);
-        return;
-    }
-    if (command == "print")
-    {
-        handlePrintCommand(commandLine);
-        return;
-    }
-    if (command == "shiftin")
-    {
-        handleShiftinCommand(commandLine);
-        return;
-    }
-    if (command == "shiftout")
-    {
-        handleShiftoutCommand(commandLine);
-        return;
-    }
-    if (command == "status")
-    {
-        commandOutput->println(F("ESP8266 Commandware ready"));
-        commandOutput->print(F("Uptime ms: "));
-        commandOutput->println(millis());
-        commandOutput->print(F("Free heap: "));
-        commandOutput->println(ESP.getFreeHeap());
-        commandOutput->print(F("Wi-Fi status: "));
-        commandOutput->println((int)WiFi.status());
-        commandOutput->print(F("IP: "));
-        commandOutput->println(WiFi.localIP());
-        return;
-    }
-
-    commandOutput->print(F("ERROR: unknown command '"));
-    commandOutput->print(command);
-    commandOutput->println(F("'"));
 }
 
 static void handleCommand(const String &line, uint16_t sourceLine)
 {
     ErrorOutputScope output(sourceLine);
     executeCommand(line);
+}
+
+// JSON transport for a single synchronous script command. Other submissions
+// retain their existing console response; source bytes never become code here.
+static std::string jsonString(const std::string &value)
+{
+    std::string result = "\"";
+    for (unsigned char c : value) {
+        if (c == '"' || c == '\\') { result += '\\'; result += (char)c; }
+        else if (c < 0x20) {
+            char escape[7]; snprintf(escape, sizeof(escape), "\\u%04x", c); result += escape;
+        } else result += (char)c;
+    }
+    return result + '"';
+}
+
+static bool scriptRequest(const String &command, const String *source, String &response)
+{
+    std::string error;
+    cw::Parser parser(error);
+    auto body = parser.parse(command.c_str());
+    auto failure = [&](const std::string &message) {
+        response = String(("{\"ok\":false,\"error\":" + jsonString(message) + "}").c_str());
+        return false;
+    };
+    if (!error.empty()) return failure(error);
+    if (body.size() != 1 || body[0].size() != 1 ||
+        cw::lower(body[0][0]->name) != "script" || body[0][0]->hasBody)
+        return failure("editor requests require a single script command");
+    auto &args = body[0][0]->args;
+    if (source && (args.empty() || cw::lower(args[0].text) != "save"))
+        return failure("source is only accepted for script save");
+    if (source && source->length() > 4096) return failure("script: source exceeds 4096 bytes");
+    auto input = std::make_shared<cw::Event>(), result = std::make_shared<cw::Event>();
+    if (source) { input->value = cw::Value(std::string(source->c_str(), source->length())); input->hasValue = true; }
+    configureScriptRuntime();
+    // Runtime console output is irrelevant to this response, including output
+    // from already running jobs serviced by the same tick.
+    class DiscardPrint : public Print { public: size_t write(uint8_t) override { return 1; } } console;
+    Print *previous = commandOutput; commandOutput = &console;
+    unsigned long id = nextJobId;
+    bool returnsValue = !args.empty() && (cw::lower(args[0].text) == "list" || cw::lower(args[0].text) == "load");
+    bool submitted = scriptRuntime.submit(command.c_str(), (uint32_t)millis(), (uint32_t)micros(), input, returnsValue ? result : nullptr);
+    commandOutput = previous;
+    if (!submitted) return failure(scriptRuntime.error);
+    for (const auto &failed : scriptRuntime.failures) if (failed.id == id) return failure(failed.message);
+    std::string value = "null";
+    if (result->hasValue && result->value.kind == cw::Value::TEXT) value = jsonString(result->value.text);
+    else if (result->hasValue && result->value.kind == cw::Value::LIST) {
+        value = "[";
+        for (size_t i = 0; i < result->value.list.size(); ++i) {
+            if (i) value += ',';
+            value += jsonString(result->value.list[i].text);
+        }
+        value += ']';
+    }
+    response = String(("{\"ok\":true,\"value\":" + value + "}").c_str());
+    return true;
 }
 
 void setup()
@@ -2605,6 +1028,8 @@ void setup()
     Serial.println(ESP.getResetReason());
     Serial.println(F("Type 'help' for commands"));
 
+    scriptStorage.begin();
+    printStorageStatus();
     configureWebServer();
     WiFi.mode(WIFI_STA);
     if (WIFI_SSID[0] != '\0')
@@ -2684,17 +1109,6 @@ void loop()
         }
     }
 
-    unsigned long now = millis();
-    if (pendingWritePulse.active && now >= pendingWritePulse.endTime)
-    {
-        pinMode(pendingWritePulse.pin, OUTPUT);
-        digitalWrite(pendingWritePulse.pin, LOW);
-        pendingWritePulse.active = false;
-        pendingWritePulse.pin = -1;
-        pendingWritePulse.endTime = 0;
-    }
-
-    serviceJobs();
     scriptRuntime.tick((uint32_t)millis(), (uint32_t)micros());
     std::string oledError;
     if (!oledDisplay.service((uint32_t)millis(), oledError)) {

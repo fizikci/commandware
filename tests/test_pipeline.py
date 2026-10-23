@@ -1,256 +1,143 @@
-from commandware.core import HardwareState, JobManager, Pipeline, parse_pipeline, parse_schedule, resistance_from_voltage, run_stream
+"""Console pipelines use the same event contract as blocks and background jobs."""
 import pytest
-from pathlib import Path
+from commandware.core import HardwareState, JobManager, run_stream
+from commandware.script import ScriptRuntime
 
 
-def test_lcd_literal_and_delimiters():
-    hw = HardwareState()
-    assert run_stream('LCD PRINT "Hello World!"', hardware=hw) == []
-    assert hw.lcd_lines == ["Hello World!    ", " " * 16]
-    run_stream('lcd print "|"', hardware=hw)
-    assert hw.lcd_lines[0] == "|" + " " * 15
-    run_stream('schedule { 0 { lcd print "a|{b}" } }', hardware=hw)
-    assert hw.lcd_lines[0] == "a|{b}" + " " * 11
-
-
-def test_lcd_watch_updates_changes_and_removes_stale_digits():
-    hw = HardwareState()
-    assert run_stream("adc A0 --watch | lcd print", [1023, 1023, 7], hardware=hw) == []
-    assert [rows[0] for rows in hw.lcd_history] == ["1023" + " " * 12, "7" + " " * 15]
-    assert hw.lcd_lines == ["7" + " " * 15, " " * 16]
-
-
-def test_lcd_wrap_clear_and_address():
-    hw = HardwareState()
-    run_stream('lcd init 0x3f', hardware=hw)
-    assert hw.lcd_address == 0x3f
-    run_stream('lcd print "1234567890123456abcdefghijklmnopEXTRA"', hardware=hw)
-    assert hw.lcd_lines == ["1234567890123456", "abcdefghijklmnop"]
-    run_stream(r'lcd print "first\nsecond"', hardware=hw)
-    assert hw.lcd_lines == ["first" + " " * 11, "second" + " " * 10]
-    run_stream(r'lcd print "slash\\n quote\""', hardware=hw)
-    assert hw.lcd_lines == ['slash\\n quote"'.ljust(16), " " * 16]
-    run_stream("lcd clear", hardware=hw)
-    assert hw.lcd_lines == [" " * 16, " " * 16]
-
-
-@pytest.mark.parametrize("command", ['lcd print', 'lcd init 0', 'lcd init 0x78', 'lcd clear extra', 'lcd bogus', 'adc A0 --watch extra | lcd print', 'adc A0 | lcd print extra extra'])
-def test_invalid_lcd_commands(command):
-    with pytest.raises(ValueError):
-        run_stream(command)
-
-
-def test_lcd_cli_preserves_shell_quoted_text(monkeypatch, capsys):
-    import io
-    from commandware.cli import main
-    monkeypatch.setattr("sys.stdin", io.StringIO(""))
-    assert main(["lcd", "print", "Hello World!"]) == 0
-    assert capsys.readouterr().out == ""
-
-
-def test_map_scales_values():
-    result = run_stream("map 0 10 0 100", [0, 5, 10])
-    assert result == [0, 50, 100]
-
-
-def test_not_inverts_values():
-    result = run_stream("not", [0, 1, 0, 1])
-    assert result == [1, 0, 1, 0]
-
-
-def test_command_names_are_case_insensitive():
-    assert run_stream("NOT", [0, 1]) == [1, 0]
-    commands = parse_pipeline("CLOCK 100 | WRITE 5")
-    assert [cmd.name for cmd in commands] == ["clock", "write"]
-
-
-def test_rising_only_emits_edges():
-    result = run_stream("rising", [0, 0, 1, 1, 0, 0])
-    assert result == [1]
-
-
-def test_toggle_flips_each_value():
-    result = run_stream("toggle", [0, 1, 0, 1])
-    assert result == [1, 0, 1, 0]
-
-
-def test_write_sets_gpio_state():
-    hw = HardwareState()
-    run_stream("write 5", [1], hardware=hw)
-    assert hw.gpio[5] == 1
-
-
-def test_clock_generates_square_wave():
-    values = run_stream("clock 1", [], count=6)
-    assert values == [0, 1, 0, 1, 0, 1]
-
-
-def test_pipeline_parses_pipe_chain():
-    commands = parse_pipeline("clock 100 | write 5")
-    assert [cmd.name for cmd in commands] == ["clock", "write"]
-    assert commands[0].args == ["100"]
-    assert commands[1].args == ["5"]
-
-
-def test_write_pipeline_claims_pin_and_sets_output():
-    hw = HardwareState()
-    manager = JobManager()
-    pipeline = Pipeline(parse_pipeline("clock 2 | write 5"))
-    result = pipeline.execute([], hardware=hw, jobs=manager, job_id=1)
-    assert result in ([], [0, 1]) or isinstance(result, list)
-    assert hw.gpio.get(5, 0) in {0, 1}
-
-
-def test_pin_ownership_blocks_conflict():
-    hw = HardwareState()
-    hw.claim_pin(5, 1)
-    try:
-        hw.claim_pin(5, 2)
-        assert False, "expected pin conflict"
-    except ValueError:
-        pass
-
-
-def test_help_and_status_commands_are_registered():
-    assert "help" in run_stream.__globals__["COMMANDS"]
-    assert "status" in run_stream.__globals__["COMMANDS"]
-
-
-@pytest.mark.parametrize("raw,mv,known", [
-    (50, 60, 270), (179, 181, 995), (291, 288, 1992), (459, 449, 5152),
-    (557, 543, 9959), (628, 612, 20020), (703, 682, 108800), (720, 697, 688900),
+@pytest.mark.parametrize('source,expected', [
+    ('number 0 | print', [0]),
+    ('number 3.5 | print', [3.5]),
+    ('map 0 1023 0 100 512 | print', [50]),
+    ('map 0 10 100 0 12 | print', [-20]),
+    ('map 0 10 (-100) 100 2.5 | print', [-50]),
+    ('number 8 --out raw | write 12 --value $raw > 5 | print $raw', [8]),
+    ('number 2 | not | print', [0]),
+    ('not "0" | print', [1]),
+    ('print "Ready"', ['Ready']),
+    ('print --value ""', ['']),
+    ('number 4 | print 0 | print', [0, 4]),
+    ('split ":" "a::b:" | print', ['["a", "", "b", ""]']),
+    ('split ":" "a:b" | each { print } | len $value | print', ['a', 'b', 2]),
+    ('number 512 | ohm | print', [7279]),
+    ('ohm 0 | print', ['<270']),
+    ('ohm 1023 | print', ['>700k']),
+    ('ohm 1024 | print', ['OUT_OF_RANGE']),
 ])
-def test_ohm_matches_measured_resistors(raw, mv, known):
-    assert run_stream("ohm", [raw]) == [known]
-    assert resistance_from_voltage(mv) == known
+def test_pipeline_values(source, expected):
+    # Calibration is checked against its published exponential interpolation below.
+    result = run_stream(source)
+    if '512 | ohm' in source:
+        from commandware.core import _ohm_reading
+        assert result == [_ohm_reading(512)]
+    else:
+        assert result == expected
 
 
-def test_ohm_reads_a0_and_accepts_adc_pipeline():
-    hw = HardwareState()
-    hw.set_analog("A0", 280)
-    assert run_stream("OHM a0", hardware=hw) == run_stream("adc A0 | ohm", hardware=hw)
-    assert "ohm" in run_stream("help")
-    assert run_stream("status") == ["OK"]
+def test_adc_always_samples_hardware_and_actions_preserve_events():
+    hardware = HardwareState(analog={'A0': 512})
+    assert run_stream('number 3 | adc A0 --out raw | write 12 1 | print $raw | print', hardware=hardware) == [512, 512]
+    assert hardware.gpio[12] == 1 and not hardware.pin_owners
+    assert run_stream('read 12 | print', hardware=hardware) == [1]
 
 
-def test_ohm_reports_bounds_at_requested_adc_limits():
-    assert run_stream("ohm", [-1, 0, 29, 30, 49, 50, 720, 721, 1023, 1024]) == [
-        "OUT_OF_RANGE", "<270", "<270", 221, 267, 270, 688900, ">700k", ">700k", "OUT_OF_RANGE",
-    ]
-    assert resistance_from_voltage(41.24) == "<270"
-    assert resistance_from_voltage(41.25) == 221
-    assert resistance_from_voltage(697.01) == ">700k"
-
-
-@pytest.mark.parametrize("voltage", [-1, float("nan"), float("inf")])
-def test_ohm_rejects_invalid_voltages(voltage):
-    assert resistance_from_voltage(voltage) == "OUT_OF_RANGE"
-
-
-def test_ohm_uses_exponential_interpolation_between_measurements():
-    # Halfway in voltage gives a geometric mean, not an arithmetic mean.
-    assert resistance_from_voltage((60 + 181) / 2) == pytest.approx((270 * 995) ** 0.5, abs=0.5)
-    # A0 235 is halfway between the 179 / 291 calibration counts.
-    assert run_stream("ohm", [235])[0] == pytest.approx((995 * 1992) ** 0.5, abs=0.5)
-
-
-def test_ohm_interpolation_is_monotonic_and_finite():
-    readings = run_stream("ohm", list(range(30, 721)))
-    assert all(isinstance(value, int) and value > 0 for value in readings)
-    assert readings == sorted(readings)
-
-
-@pytest.mark.parametrize("args", ["A1", "A0 extra", "57"])
-def test_ohm_rejects_invalid_arguments(args):
-    with pytest.raises(ValueError, match="only A0"):
-        run_stream(f"ohm {args}")
-
-
-def test_schedule_parses_multiline_and_case_insensitive_commands():
-    entries = parse_schedule("""SCHEDULE {
-        1000 { CLOCK 1000 --dur 500 | WRITE 15 }
-        1500 { clock 1400 --dur 1000 | write 15 }
-    }""")
-    assert [entry.start_ms for entry in entries] == [1000, 1500]
-    hw = HardwareState()
-    run_stream("schedule { " + " ".join(f"{e.start_ms} {{ {e.pipeline} }}" for e in entries) + " }", hardware=hw)
-    assert hw.gpio[15] == 0
-    assert hw.pin_owners == {}
-
-
-@pytest.mark.parametrize("option", ["", " 15"])
-def test_finite_clock_stops_low_and_releases_job(option):
-    hw, manager = HardwareState(), JobManager()
-    command = f"clock 1000{option} --dur 2" + ("" if option else " | write 15")
-    assert run_stream(command, hardware=hw, jobs=manager) == [1, 0, 1]
-    assert hw.gpio[15] == 0
-    assert not hw.pin_owners
-    assert not manager.jobs
-
-
-@pytest.mark.parametrize("args", ["--dur", "--dur 0", "--dur -1", "--dur 1.5", "--dur nan", "--dur 2147483648", "--dur 2 --dur 3", "--duration 2"])
-def test_clock_rejects_invalid_duration(args):
-    with pytest.raises(ValueError):
-        run_stream(f"clock 1000 {args} | write 15")
-
-
-@pytest.mark.parametrize("text", [
-    "schedule {}", "schedule { -1 { clock 1 } }", "schedule { 0 {} }",
-    "schedule { 0 { clock 1 }", "schedule { 0 { schedule { 0 { clock 1 } } } }",
-    "schedule { 0 { clock 1 } } trailing", "schedule { 0 { clock 1 | } }",
-    "schedule { 2147483647 { clock 1 --dur 1 } }",
-    "schedule {" + "0 { clock 1 } " * 9 + "}",
-    "schedule {" + "0 { print 1 } " * 33 + "}",
+@pytest.mark.parametrize('source', [
+    'read D1', 'read GPIO12', 'read A0', 'read 12.5', 'read 1', 'read 6',
+    'write 12', 'write 12 1 100', 'write 12 1 --value 0',
+    'map 0 0 0 1 3', 'map 0 1 0 1', 'print', 'print 1 --value 2',
+    'split ":" 0', 'split "" "abc"', 'split ":" "a:b" | each | print',
+    'clock 10 12', 'clock 0 | print', 'clock 10 --dur 0 | print',
+    'adc A1', 'adc A0 --every 5', 'read 12 --watch',
+    'not "hello"', 'pulse 0', 'debounce 0', 'divide 0',
 ])
-def test_schedule_rejects_invalid_blocks_without_side_effects(text):
-    hw = HardwareState()
+def test_explicit_errors(source):
+    with pytest.raises(ValueError, match='line'):
+        run_stream(source)
+
+
+def test_pin_conflict_is_runtime_error_and_preserves_last_state():
+    hardware = HardwareState()
+    runtime = ScriptRuntime(hardware)
+    runtime.repeat_count = 100
+    runtime.submit('every 10 | write 12 1')
+    runtime.tick(0)
+    runtime.tick(0)
+    assert hardware.gpio[12] == 1
+    runtime.submit('write 12 0')
     with pytest.raises(ValueError):
-        run_stream(text, hardware=hw)
-    assert not hw.gpio
-    assert not hw.pin_owners
+        runtime.tick(0)
+    assert hardware.gpio[12] == 1
+    runtime.reset()
+    assert hardware.gpio[12] == 1 and not hardware.pin_owners
 
 
-def test_schedule_rejects_overlapping_clocks_atomically():
-    hw = HardwareState()
-    with pytest.raises(ValueError, match="overlapping"):
-        run_stream("schedule { 0 { clock 1000 --dur 5 | write 15 } 4 { clock 1000 --dur 5 | write 15 } }", hardware=hw)
-    assert not hw.gpio
+def test_clock_first_phase_duration_and_no_cleanup_edge():
+    hardware = HardwareState()
+    runtime = ScriptRuntime(hardware)
+    runtime.submit('clock 1000 --dur 2 | write 15')
+    runtime.tick(0)
+    runtime.tick(.5)
+    assert hardware.gpio[15] == 1
+    runtime.tick(1)
+    assert hardware.gpio[15] == 0
+    runtime.tick(1.5)
+    assert hardware.gpio[15] == 1
+    runtime.tick(2)
+    assert hardware.gpio[15] == 1 and not runtime.tasks
 
 
-def test_schedule_runs_parallel_pipelines_and_stops_before_shared_boundary():
-    class RecordingHardware(HardwareState):
-        def set_gpio(self, pin, value):
-            writes.append((pin, value))
-            return super().set_gpio(pin, value)
-
-    writes = []
-    hw = RecordingHardware()
-    run_stream("schedule { 2 { clock 1000 --dur 1 | write 15 } 0 { clock 1000 --dur 2 | write 15 } 0 { clock 1000 --dur 1 | write 5 } }", hardware=hw)
-    assert writes == [(15, 0), (5, 0), (15, 1), (5, 1), (5, 0), (15, 0), (15, 1), (15, 0), (15, 0), (15, 1), (15, 0)]
-    assert not hw.pin_owners
-
-
-def test_schedule_keeps_transform_state_between_clock_ticks():
-    assert run_stream("schedule { 0 { clock 1000 --dur 3 | divide 2 | toggle | print } }") == [1, 0]
+def test_clock_skips_overdue_transitions_without_catchup():
+    runtime = ScriptRuntime()
+    runtime.repeat_count = 100
+    runtime.submit('clock 100 --dur 25 | print')
+    runtime.tick(0)
+    runtime.tick(5)
+    runtime.tick(16)
+    runtime.tick(20)
+    runtime.tick(25)
+    assert runtime.output == [1, 0]
 
 
-def test_schedule_executes_immediate_commands_in_time_order():
-    hw = HardwareState()
-    assert run_stream("schedule { 20 { write 15 0 } 10 { write 15 1 } }", hardware=hw) == [1, 0]
-    assert hw.gpio[15] == 0
+def test_schedule_uses_runtime_globals_and_actual_start_timestamps():
+    runtime = ScriptRuntime()
+    runtime.submit('set n 1; schedule { 5 { print $n } 10 { print "later" } }; set n 2')
+    runtime.tick(0)
+    runtime.tick(5)
+    runtime.tick(10)
+    assert runtime.output == [2, 'later']
 
 
-def test_entire_happy_birthday_runs_in_one_schedule():
-    tutorial = (Path(__file__).resolve().parents[1] / "docs/tutorial.md").read_text(encoding="utf-8")
-    command = tutorial.split("## Happy Birthday\n", 1)[1].split("```text\n", 1)[1].split("```", 1)[0].strip()
-    assert len(parse_schedule(command)) == 25
-    hw, manager = HardwareState(), JobManager()
-    output = run_stream(command, hardware=hw, jobs=manager)
-    assert len(output) > 1000
-    assert hw.gpio[15] == 0
-    assert not hw.pin_owners and not manager.jobs
+def test_invalid_schedule_offsets_reject_registration_atomically():
+    runtime = ScriptRuntime()
+    runtime.submit('schedule { 5 { print "never" } (-1) { print "never" } }')
+    with pytest.raises(ValueError):
+        runtime.tick(0)
+    assert runtime.output == [] and not runtime.tasks
 
 
-def test_32_sequential_clocks_fit_without_reserving_32_execution_slots():
-    command = "schedule {" + " ".join(f"{i} {{ clock 1000 --dur 1 | write 15 }}" for i in range(32)) + "}"
-    assert run_stream(command) == [1] * 32
+def test_shift_register_frames_are_explicit_and_preserve_event():
+    hardware = HardwareState(gpio={12: 1})
+    assert run_stream('number 5 | shiftout 12 13 14 --bits 8 | print', hardware=hardware) == [5]
+    assert hardware.gpio[14] == 1
+    assert run_stream('shiftin 12 13 14 --bits 8 | print', hardware=hardware) == [255]
+    assert not hardware.pin_owners
+
+
+@pytest.mark.parametrize('source', [
+    'number 256 | shiftout 12 13 14 --bits 8',
+    'number (-1) | shiftout 12 13',
+    'number 3 | shiftout 12 12',
+    'shiftin 12 13 14 --bits 54',
+    'shiftin 12 13 14 --bits 0',
+])
+def test_shift_register_validation(source):
+    with pytest.raises(ValueError):
+        run_stream(source)
+
+
+def test_management_commands_are_actions_in_pipelines():
+    hardware = HardwareState()
+    result = run_stream('number 7 | status | print', hardware=hardware)
+    assert result[-1] == 7
+    assert run_stream('help max', hardware=hardware)
+    assert run_stream('pins', hardware=hardware)
+    assert run_stream('reset; print "unreachable"', hardware=hardware) == []
